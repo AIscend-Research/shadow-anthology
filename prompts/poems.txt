@@ -1,0 +1,19 @@
+# Prompts for corpus runs. One per line; '#' comments and blank lines ignored.
+# Deliberately mixed: concrete/abstract subjects, different registers and forms,
+# so that any poem-vs-shadow effect is not an artefact of a single subject.
+Write a short poem about winter light on water.
+Write a short poem about a house that is no longer lived in.
+Write a short poem about hunger.
+Write a short poem about an animal you have never seen.
+Write a short poem about the hour before rain.
+Write a short poem about repair — something mended badly.
+Write a short poem about a machine that has outlived its purpose.
+Write a short poem about salt.
+Write a short poem about forgetting a name.
+Write a short poem about the edge of a field at dusk.
+Write a short poem about grief without using the word grief.
+Write a short poem about something small and metal.
+Write a short poem in which nothing happens.
+Write a short poem about a colour you cannot name.
+Write a short poem addressed to a stranger on a train.
+Write a short poem about the inside of a fruit.

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shadow-anthology"
+version = "0.1.0"
+description = "Reconstructing the poems a language model almost wrote, from the sampler's own distribution."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "TODO: author name", email = "luzijing2004@yahoo.com" }]
+keywords = ["poetry", "language models", "sampling", "counterfactuals", "creative ai"]
+dependencies = []
+
+[project.optional-dependencies]
+hf = ["torch>=2.0", "transformers>=4.40"]
+openai = ["httpx>=0.24"]
+stats = ["numpy>=1.24", "scipy>=1.10"]
+dev = ["pytest>=7"]
+all = ["torch>=2.0", "transformers>=4.40", "httpx>=0.24", "numpy>=1.24", "scipy>=1.10", "pytest>=7"]
+
+[project.scripts]
+shadow = "shadow_anthology.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["shadow_anthology"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

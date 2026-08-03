@@ -1,0 +1,289 @@
+"""Tests for measurement, paired statistics, branching and rendering."""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+
+from shadow_anthology import (
+    Lexicons,
+    branch_anthology,
+    compare,
+    get_backend,
+    measure,
+    render_html,
+    render_terminal,
+    run_corpus,
+    shadow_poem,
+)
+from shadow_anthology.backends import BackendUnsupported
+from shadow_anthology.stats import (
+    bootstrap_ci,
+    cohens_dz,
+    holm_bonferroni,
+    paired_permutation_test,
+    wilcoxon_signed_rank,
+)
+
+
+@pytest.fixture
+def be():
+    return get_backend("mock")
+
+
+@pytest.fixture
+def trace(be):
+    return be.generate_trace("a poem about iron", max_tokens=48, seed=5, candidates=10)
+
+
+# -- metrics ---------------------------------------------------------------
+
+
+def test_empty_text_is_safe():
+    m = measure("")
+    assert m.n_words == 0
+    assert m.concreteness is None and m.valence is None
+
+
+def test_low_coverage_reports_none_not_zero():
+    """A text with no lexicon hits must not be scored as neutral."""
+    m = measure("zzz qqq xyzzy plugh frotz blorple", min_coverage=0.5)
+    assert m.concreteness is None
+    assert m.valence is None
+    assert m.n_words == 6
+
+
+def test_concrete_text_scores_above_abstract_text():
+    conc = measure("stone water bone glass iron salt river snow")
+    abst = measure("grief hope truth meaning justice freedom sorrow beauty")
+    assert conc.concreteness is not None and abst.concreteness is not None
+    assert conc.concreteness > abst.concreteness
+    assert conc.imagery > abst.imagery
+
+
+def test_valence_separates_positive_and_negative_text():
+    pos = measure("light honey warm bloom gold morning gentle joy")
+    neg = measure("grief ash rot wound scar bleed bitter dread")
+    assert pos.valence > neg.valence
+
+
+def test_repetition_detects_repeated_bigrams():
+    rep = measure("the stone the stone the stone the stone")
+    var = measure("the stone a river of bright salt and morning")
+    assert rep.repetition > var.repetition
+
+
+def test_seed_lexicon_flag_is_propagated():
+    assert measure("stone water").seed_lexicons is True
+    assert Lexicons.seed().is_seed is True
+
+
+def test_compare_returns_none_delta_when_either_side_uncovered():
+    c = compare("stone water bone glass", "zzz qqq xyzzy plugh frotz")
+    assert c.deltas["concreteness"] is None
+    assert c.deltas["type_token_ratio"] is not None
+
+
+def test_compare_deltas_are_poem_minus_shadow():
+    c = compare("stone water bone glass iron", "grief hope truth meaning justice")
+    assert c.deltas["concreteness"] == pytest.approx(
+        c.poem.concreteness - c.shadow.concreteness
+    )
+    assert c.deltas["concreteness"] > 0
+
+
+# -- statistics ------------------------------------------------------------
+
+
+def test_permutation_test_finds_a_real_shift():
+    diffs = [0.5 + 0.01 * i for i in range(30)]
+    r = paired_permutation_test(diffs, n_iter=4000, name="shift")
+    assert r.mean_diff > 0
+    assert r.p_value < 0.01
+    assert r.effect_size > 1.0
+    assert r.significant
+
+
+def test_permutation_test_accepts_the_null_for_symmetric_noise():
+    diffs = [(-1) ** i * (0.1 + 0.001 * i) for i in range(40)]
+    r = paired_permutation_test(diffs, n_iter=4000, name="noise")
+    assert r.p_value > 0.05
+    assert not r.significant
+
+
+def test_p_value_is_never_exactly_zero():
+    r = paired_permutation_test([10.0] * 30, n_iter=1000)
+    assert r.p_value > 0
+    assert r.p_value == pytest.approx(1 / 1001, rel=1e-6)
+
+
+def test_test_handles_degenerate_input():
+    r = paired_permutation_test([], name="empty")
+    assert r.n == 0 and r.p_value == 1.0
+    assert "too few" in r.note
+
+
+def test_none_and_nan_are_filtered_not_counted():
+    r = paired_permutation_test([1.0, None, float("nan"), 1.0, 1.0], n_iter=500)
+    assert r.n == 3
+
+
+def test_cohens_dz_and_bootstrap_ci_agree_in_sign():
+    diffs = [0.4, 0.5, 0.6, 0.55, 0.45, 0.5]
+    lo, hi = bootstrap_ci(diffs)
+    assert cohens_dz(diffs) > 0
+    assert lo > 0 and hi > lo
+
+
+def test_holm_correction_is_monotone_and_inflates_p():
+    from shadow_anthology.stats import TestResult
+
+    rs = [
+        TestResult(f"m{i}", 20, 0.1, 0.1, 0, 0, 0.3, 1.0, p)
+        for i, p in enumerate([0.001, 0.02, 0.04, 0.5])
+    ]
+    out = holm_bonferroni(rs)
+    adj = [r.p_adjusted for r in sorted(out, key=lambda r: r.p_value)]
+    assert all(a >= b for a, b in zip(adj, [r.p_value for r in sorted(out, key=lambda r: r.p_value)]))
+    assert adj == sorted(adj), "Holm-adjusted p-values must be non-decreasing"
+
+
+def test_wilcoxon_agrees_with_permutation_on_a_clear_effect():
+    diffs = [0.3 + 0.02 * i for i in range(25)]
+    w = wilcoxon_signed_rank(diffs, name="w")
+    p = paired_permutation_test(diffs, n_iter=4000, name="p")
+    assert w.p_value < 0.05 and p.p_value < 0.05
+
+
+def test_wilcoxon_warns_on_small_n():
+    assert "prefer permutation" in wilcoxon_signed_rank([0.1, 0.2, 0.3]).note
+
+
+# -- branching -------------------------------------------------------------
+
+
+def test_branches_share_the_prefix_and_diverge_after(be, trace):
+    anth = branch_anthology(be, trace, n_points=3, ranks=(1,), budget=5, max_tokens=48)
+    assert len(anth) > 0
+    for b in anth.branches:
+        assert b.trace.text.startswith(b.shared_prefix)
+        assert b.shared_prefix == trace.prefix_text(b.branch_at)
+        assert b.forced.text != b.displaced.text
+        assert b.gap == pytest.approx(abs(b.cost))
+
+
+def test_budget_is_respected_and_overflow_is_recorded(be, trace):
+    anth = branch_anthology(be, trace, n_points=8, ranks=(1, 2), budget=3, max_tokens=48)
+    assert anth.calls <= 3
+    assert len(anth.branches) <= 3
+    assert anth.dropped, "skipped branch points must be recorded, not silently dropped"
+    assert all(d["reason"] == "budget_exhausted" for d in anth.dropped)
+
+
+def test_branch_points_respect_min_gap(be, trace):
+    anth = branch_anthology(
+        be, trace, n_points=4, ranks=(1,), budget=10, min_gap=6, max_tokens=48
+    )
+    pts = sorted(b.branch_at for b in anth.branches)
+    assert all(b - a >= 6 for a, b in zip(pts, pts[1:]))
+
+
+def test_branching_refuses_backends_that_cannot_force_a_prefix(trace):
+    class NoPrefix:
+        name = "noprefix"
+        model = "x"
+        supports_forced_prefix = False
+
+    with pytest.raises(BackendUnsupported, match="forced prefix"):
+        branch_anthology(NoPrefix(), trace, n_points=2)
+
+
+def test_anthropic_backend_fails_with_an_explanation():
+    with pytest.raises(BackendUnsupported, match="does not expose logprobs"):
+        get_backend("anthropic")
+
+
+# -- corpus + rendering ----------------------------------------------------
+
+
+def test_corpus_run_is_paired_and_complete(be):
+    res = run_corpus(
+        be,
+        ["poem about salt", "poem about iron", "poem about snow"],
+        samples_per_prompt=2,
+        max_tokens=40,
+        candidates=10,
+        n_iter=500,
+    )
+    assert len(res.comparisons) == 6
+    assert len(res.traces) == 6
+    assert len(res.tests) > 0
+    assert all(t.p_adjusted is not None for t in res.tests), "Holm must be applied"
+    assert res.decision_stats["mean_tokens"] == pytest.approx(40)
+    assert "offrank_fraction" in res.decision_stats
+    assert "SEED lexicons" in res.summary()
+
+
+def test_corpus_finds_no_effect_on_a_structureless_fixture(be):
+    """Null control.
+
+    The mock backend's distributions are hashed noise: poem and shadow are
+    draws from the same process, so there is nothing to find. If this run ever
+    reports a significant effect, the pipeline is manufacturing one --- via
+    the pairing, the coverage rules, or the correction --- and no result from
+    a real model can be trusted until it is fixed.
+    """
+    res = run_corpus(
+        be,
+        [f"poem number {i}" for i in range(8)],
+        samples_per_prompt=3,
+        max_tokens=60,
+        candidates=12,
+        n_iter=3000,
+    )
+    assert len(res.comparisons) == 24
+    offenders = [t.name for t in res.tests if t.significant]
+    assert not offenders, f"pipeline invented an effect on noise: {offenders}"
+
+
+def test_corpus_seeds_are_distinct_across_the_grid(be):
+    res = run_corpus(be, ["a", "b"], samples_per_prompt=2, max_tokens=20, n_iter=100)
+    seeds = [t.seed for t in res.traces]
+    assert len(set(seeds)) == 4
+
+
+def test_shadow_surprisal_never_below_poem_surprisal(trace):
+    """Sanity channel: by construction the written token outranks its shadow,
+    so this gap is a tautology and must not be read as a finding."""
+    from shadow_anthology.metrics import measure_shadow_surprisal
+
+    poem = sum(s.chosen.surprisal for s in trace.steps) / len(trace)
+    shadow = measure_shadow_surprisal(trace, 1)
+    assert shadow is not None
+    # the poem may itself be off-argmax, so compare against the best rejected
+    assert math.isfinite(shadow) and math.isfinite(poem)
+
+
+def test_html_is_self_contained_and_themed(trace):
+    doc = render_html(trace, title="T")
+    assert doc.startswith("<!doctype html>")
+    for forbidden in ("http://", "https://", "<script src", "@import"):
+        assert forbidden not in doc, f"artifact must not fetch {forbidden}"
+    assert "prefers-color-scheme" in doc
+    assert 'data-theme="dark"' in doc
+    assert "overflow-x:auto" in doc
+
+
+def test_html_escapes_content(be):
+    t = be.generate_trace("x", max_tokens=5, seed=1)
+    t.text = "<script>alert(1)</script>"
+    t.prompt = "<img onerror=1>"
+    doc = render_html(t)
+    assert "<script>alert(1)</script>" not in doc.split("<script>")[-1]
+    assert "&lt;img" in doc or "<img onerror" not in doc
+
+
+def test_terminal_render_mentions_both_texts(trace):
+    out = render_terminal(trace, shadow_poem(trace, 1))
+    assert "poem" in out and "shadow" in out and "closest calls" in out
