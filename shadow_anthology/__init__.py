@@ -13,7 +13,14 @@ runnable end-to-end example with no dependencies.
 
 from .anthology import Anthology, Branch, branch_anthology
 from .backends import Backend, BackendUnsupported, get_backend
-from .corpus import CorpusResult, load_prompts, run_corpus, save_corpus
+from .corpus import (
+    CorpusResult,
+    analyse_traces,
+    generate_traces,
+    load_prompts,
+    run_corpus,
+    save_corpus,
+)
 from .lexicons import Lexicons
 from .metrics import Comparison, PoemMetrics, compare, measure
 from .render import render_html, render_terminal, write_html
@@ -39,4 +46,5 @@ __all__ = [
     "holm_bonferroni", "load_prompts", "load_traces", "measure",
     "paired_permutation_test", "render_html", "render_terminal", "run_corpus",
     "save_corpus", "save_traces", "shadow_family", "shadow_poem", "write_html",
+    "analyse_traces", "generate_traces",
 ]

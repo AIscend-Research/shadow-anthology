@@ -247,6 +247,35 @@ def test_corpus_finds_no_effect_on_a_structureless_fixture(be):
     assert not offenders, f"pipeline invented an effect on noise: {offenders}"
 
 
+def test_concurrency_does_not_change_results(be):
+    """Parallel generation must be a pure speedup: same traces, same order."""
+    from shadow_anthology.corpus import generate_traces
+
+    prompts = ["poem about salt", "poem about iron", "poem about snow"]
+    serial = generate_traces(be, prompts, samples_per_prompt=4, max_tokens=30)
+    parallel = generate_traces(
+        be, prompts, samples_per_prompt=4, max_tokens=30, concurrency=8
+    )
+    assert [t.text for t in serial] == [t.text for t in parallel]
+    assert [t.seed for t in parallel] == list(range(12))
+
+
+def test_rank_sweep_reuses_identical_traces(be):
+    """Rank sweeps must analyse one fixed trace set.
+
+    Regenerating per rank would compare rank 1 against rank 2 across different
+    poems, destroying the pairing the design depends on.
+    """
+    from shadow_anthology.corpus import analyse_traces, generate_traces
+
+    traces = generate_traces(be, ["a", "b", "c"], samples_per_prompt=3, max_tokens=40)
+    results = [analyse_traces(traces, rank=r, n_iter=200) for r in (1, 2, 3)]
+    poems = [[c.poem.n_words for c in r.comparisons] for r in results]
+    assert poems[0] == poems[1] == poems[2], "the poem side must be identical"
+    shadows = [tuple(s.text for s in r.shadows) for r in results]
+    assert len(set(shadows)) == 3, "each rank must yield a distinct shadow set"
+
+
 def test_corpus_seeds_are_distinct_across_the_grid(be):
     res = run_corpus(be, ["a", "b"], samples_per_prompt=2, max_tokens=20, n_iter=100)
     seeds = [t.seed for t in res.traces]

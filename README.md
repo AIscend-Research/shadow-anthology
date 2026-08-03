@@ -104,32 +104,60 @@ prompts yourself, or use `--endpoint chat` and give up branching.
 The analysis pipeline is complete and tested. **No real model has been run yet**
 — everything below is ready to execute against `fireworks` or `hf`.
 
+Only **E1, E3 and E5 generate anything**. E2 and E4 are re-analyses of traces
+already on disk — they cost nothing and, more importantly, *must* reuse the same
+traces: regenerating per rank would compare rank 1 against rank 2 across
+different poems and silently destroy the pairing the whole design rests on.
+
 ```bash
-# E1 — main corpus: poem vs rank-1 shadow, paired tests over 16 prompts
-python -m shadow_anthology.cli corpus --prompts prompts/poems.txt \
-  --backend fireworks --model accounts/fireworks/models/llama-v3p1-8b-instruct \
-  --samples 8 --candidates 5 --temperature 1.0 --out runs/main
+FW="--backend fireworks --model accounts/fireworks/models/llama-v3p1-8b-instruct"
 
-# E2 — rank depth: does divergence grow monotonically with rank?
+# E1 — main corpus: poem vs rank-1 shadow, paired tests over 16 prompts.  [GENERATES]
+python -m shadow_anthology.cli corpus --prompts prompts/poems.txt $FW \
+  --samples 8 --candidates 5 --temperature 1.0 --concurrency 8 --out runs/T1.0
+
+# E2 — rank depth: does divergence grow monotonically with rank?          [FREE]
 for r in 1 2 3; do
-  python -m shadow_anthology.cli corpus --prompts prompts/poems.txt \
-    --backend fireworks --rank $r --out runs/rank$r
+  python -m shadow_anthology.cli corpus --from-traces runs/T1.0/traces.jsonl \
+    --rank $r --out runs/rank$r
 done
 
-# E3 — temperature sweep: how much of the poem is the sampler?
-for t in 0.3 0.7 1.0 1.3; do
-  python -m shadow_anthology.cli corpus --prompts prompts/poems.txt \
-    --backend fireworks --temperature $t --out runs/T$t
+# E3 — temperature sweep: how much of the poem is the sampler?            [GENERATES]
+for t in 0.3 0.7 1.3; do    # T=1.0 is E1 above, don't regenerate it
+  python -m shadow_anthology.cli corpus --prompts prompts/poems.txt $FW \
+    --samples 8 --candidates 5 --temperature $t --concurrency 8 --out runs/T$t
 done
 
-# E4 — gated vs full shadow
-python -m shadow_anthology.cli corpus --prompts prompts/poems.txt \
-  --backend fireworks --top-n 12 --out runs/gated
+# E4 — gated vs full shadow                                               [FREE]
+python -m shadow_anthology.cli corpus --from-traces runs/T1.0/traces.jsonl \
+  --top-n 12 --out runs/gated
 
-# E5 — branching anthology: poems the model would have written
-python -m shadow_anthology.cli branch --trace trace.json \
-  --backend fireworks --points 8 --ranks 1 2 --budget 24 --out anthology.json
+# E5 — branching anthology: poems the model would have written            [GENERATES]
+python -m shadow_anthology.cli trace --prompt "Write a short poem about salt." \
+  $FW --candidates 5 --out trace.json
+python -m shadow_anthology.cli branch --trace trace.json $FW \
+  --points 8 --ranks 1 2 --budget 24 --out anthology.json
 ```
+
+### Cost and runtime
+
+536 generations at 160 max output tokens ≈ **0.10M tokens**. An 8B model sits in
+the Fireworks 4B–16B serverless band at **$0.20/1M tokens**, so the whole suite
+is about **2 cents**. Cost is not a constraint here — even 64 samples/prompt is
+~16¢ — so size the run for statistical power, not for budget.
+
+| samples/prompt | generations | tokens | cost |
+|---|---|---|---|
+| 8 | 536 | 0.10M | $0.02 |
+| 16 | 1,048 | 0.20M | $0.04 |
+| 32 | 2,072 | 0.39M | $0.08 |
+| 64 | 4,120 | 0.78M | $0.16 |
+
+Wall-clock is the real cost, and it's all generation latency. At a rough
+100–300 tok/s for a serverless 8B: **7–13 min serial**, or **under 2 min at
+`--concurrency 8`**. Parallel generation is a pure speedup — traces come back in
+grid order with seeds unchanged, asserted by a test — but it is unsafe for a
+local `hf` model, where the CLI forces concurrency back to 1.
 
 **E3 is the load-bearing one.** `offrank_fraction` — the share of positions where
 the sampler did *not* take the model's preferred token — is the sampler's

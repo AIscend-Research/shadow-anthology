@@ -79,6 +79,129 @@ class CorpusResult:
             json.dump(self.to_dict(), fh, ensure_ascii=False, indent=1)
 
 
+def generate_traces(
+    backend: Backend,
+    prompts: Sequence[str],
+    *,
+    samples_per_prompt: int = 4,
+    max_tokens: int = 160,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    candidates: int = 20,
+    system: str | None = None,
+    seed0: int = 0,
+    concurrency: int = 1,
+    on_progress: Callable[[int, int, GenerationTrace], None] | None = None,
+) -> list[GenerationTrace]:
+    """Generate the (prompt x sample) grid. This is the only part that costs.
+
+    Seeds are `seed0 + i` over the flattened grid, so a run is reproducible
+    from `seed0` alone and any single poem can be regenerated on its own.
+
+    `concurrency > 1` issues requests in parallel, which is worth doing against
+    a hosted API (generation is the entire wall-clock cost) and is **not** safe
+    for a single local `hf` model --- one torch module cannot serve concurrent
+    generate loops. Results are always returned in grid order regardless of
+    completion order, so a run is deterministic no matter the concurrency.
+    """
+    grid = [
+        (i, p_i, s_i, prompt)
+        for i, (p_i, s_i, prompt) in enumerate(
+            (p_i, s_i, prompt)
+            for p_i, prompt in enumerate(prompts)
+            for s_i in range(samples_per_prompt)
+        )
+    ]
+
+    def one(item: tuple[int, int, int, str]) -> tuple[int, GenerationTrace]:
+        i, _p, _s, prompt = item
+        return i, backend.generate_trace(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            candidates=candidates,
+            seed=seed0 + i,
+            system=system,
+        )
+
+    out: dict[int, GenerationTrace] = {}
+    done = 0
+    if concurrency > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [pool.submit(one, item) for item in grid]
+            for fut in as_completed(futures):
+                i, tr = fut.result()
+                out[i] = tr
+                done += 1
+                if on_progress:
+                    on_progress(done, len(grid), tr)
+    else:
+        for item in grid:
+            i, tr = one(item)
+            out[i] = tr
+            done += 1
+            if on_progress:
+                on_progress(done, len(grid), tr)
+
+    return [out[i] for i in range(len(grid))]
+
+
+def analyse_traces(
+    traces: Sequence[GenerationTrace],
+    *,
+    rank: int = 1,
+    gated: bool = False,
+    gate_top_n: int | None = None,
+    gate_max_cost: float | None = None,
+    lex: Lexicons | None = None,
+    n_iter: int = 20000,
+    seed: int = 0,
+    config: dict[str, Any] | None = None,
+) -> CorpusResult:
+    """Pair each poem with its shadow and test. Costs nothing --- no generation.
+
+    Rank sweeps and gating comparisons **must** go through this function on one
+    fixed set of traces. Regenerating per rank would compare rank 1 against
+    rank 2 across different poems, which silently destroys the pairing that the
+    whole design rests on.
+    """
+    lex = lex or DEFAULT
+    res = CorpusResult(
+        config={
+            **{
+                "model": traces[0].model if traces else "?",
+                "backend": traces[0].backend if traces else "?",
+                "n_traces": len(traces),
+                "rank": rank,
+                "gated": gated,
+                "gate_top_n": gate_top_n,
+                "gate_max_cost": gate_max_cost,
+                "analysed": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            },
+            **(config or {}),
+        }
+    )
+
+    for i, trace in enumerate(traces):
+        sh = (
+            gated_shadow(trace, rank, top_n=gate_top_n, max_cost=gate_max_cost)
+            if gated
+            else shadow_poem(trace, rank)
+        )
+        res.traces.append(trace)
+        res.shadows.append(sh)
+        res.comparisons.append(
+            compare(trace.text, sh.text, trace=trace, lex=lex, rank=rank, label=f"t{i}")
+        )
+
+    res.decision_stats = _decision_stats(res.traces, res.shadows)
+    res.tests, res.dropped = _run_tests(res.comparisons, n_iter=n_iter, seed=seed)
+    return res
+
+
 def run_corpus(
     backend: Backend,
     prompts: Sequence[str],
@@ -94,74 +217,48 @@ def run_corpus(
     candidates: int = 20,
     system: str | None = None,
     seed0: int = 0,
+    concurrency: int = 1,
     lex: Lexicons | None = None,
     n_iter: int = 20000,
     on_progress: Callable[[int, int, GenerationTrace], None] | None = None,
 ) -> CorpusResult:
-    """Generate a corpus, pair each poem with its shadow, and test.
+    """Generate a corpus and analyse it: `generate_traces` then `analyse_traces`.
 
-    Seeds are `seed0 + i` over the flattened (prompt, sample) grid, so a run is
-    reproducible from `seed0` alone and any single pair can be regenerated.
+    To sweep rank or gating, call `generate_traces` once and `analyse_traces`
+    repeatedly over the same traces --- do not call this function per setting.
     """
-    lex = lex or DEFAULT
-    res = CorpusResult(
+    traces = generate_traces(
+        backend, prompts,
+        samples_per_prompt=samples_per_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        candidates=candidates,
+        system=system,
+        seed0=seed0,
+        concurrency=concurrency,
+        on_progress=on_progress,
+    )
+    return analyse_traces(
+        traces,
+        rank=rank,
+        gated=gated,
+        gate_top_n=gate_top_n,
+        gate_max_cost=gate_max_cost,
+        lex=lex,
+        n_iter=n_iter,
+        seed=seed0,
         config={
-            "model": getattr(backend, "model", "?"),
-            "backend": backend.name,
             "n_prompts": len(prompts),
             "samples_per_prompt": samples_per_prompt,
-            "rank": rank,
-            "gated": gated,
-            "gate_top_n": gate_top_n,
-            "gate_max_cost": gate_max_cost,
             "temperature": temperature,
             "top_p": top_p,
             "candidates": candidates,
             "max_tokens": max_tokens,
             "seed0": seed0,
-            "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
+            "concurrency": concurrency,
+        },
     )
-
-    total = len(prompts) * samples_per_prompt
-    i = 0
-    for p_i, prompt in enumerate(prompts):
-        for s_i in range(samples_per_prompt):
-            seed = seed0 + i
-            trace = backend.generate_trace(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                candidates=candidates,
-                seed=seed,
-                system=system,
-            )
-            if gated:
-                sh = gated_shadow(
-                    trace, rank, top_n=gate_top_n, max_cost=gate_max_cost
-                )
-            else:
-                sh = shadow_poem(trace, rank)
-
-            cmp_ = compare(
-                trace.text,
-                sh.text,
-                trace=trace,
-                lex=lex,
-                rank=rank,
-                label=f"p{p_i}s{s_i}",
-            )
-            res.traces.append(trace)
-            res.shadows.append(sh)
-            res.comparisons.append(cmp_)
-            i += 1
-            if on_progress:
-                on_progress(i, total, trace)
-
-    res.decision_stats = _decision_stats(res.traces, res.shadows)
-    res.tests, res.dropped = _run_tests(res.comparisons, n_iter=n_iter, seed=seed0)
-    return res
 
 
 def _run_tests(

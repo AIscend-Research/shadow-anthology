@@ -18,19 +18,36 @@ from typing import Any, Sequence
 
 from .anthology import branch_anthology
 from .backends import BackendUnsupported, get_backend
-from .corpus import load_prompts, run_corpus, save_corpus
+from .corpus import (
+    analyse_traces,
+    generate_traces,
+    load_prompts,
+    run_corpus,
+    save_corpus,
+)
 from .lexicons import Lexicons
 from .metrics import compare
 from .render import render_html, render_terminal, write_html
 from .shadow import gated_shadow, shadow_family, shadow_poem
-from .trace import GenerationTrace
+from .trace import GenerationTrace, load_traces
 
 
 def _backend_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--backend", default="mock", choices=["mock", "hf", "openai", "anthropic"])
+    p.add_argument(
+        "--backend",
+        default="mock",
+        choices=["mock", "hf", "fireworks", "openai", "anthropic"],
+    )
     p.add_argument("--model", default=None, help="model id for the chosen backend")
-    p.add_argument("--base-url", default="https://api.openai.com/v1")
-    p.add_argument("--endpoint", default="chat", choices=["chat", "completions"])
+    p.add_argument("--base-url", default=None, help="override the backend's default")
+    p.add_argument(
+        "--endpoint", default=None, choices=["chat", "completions"],
+        help="completions keeps forced-prefix branching available; chat does not",
+    )
+    p.add_argument(
+        "--max-top-logprobs", type=int, default=None,
+        help="server cap on retained alternatives (Fireworks default 5)",
+    )
     p.add_argument("--device", default=None)
 
 
@@ -53,10 +70,18 @@ def _make_backend(a: argparse.Namespace) -> Any:
     kw: dict[str, Any] = {}
     if a.backend == "hf":
         kw = {"model": a.model or "gpt2", "device": a.device}
-    elif a.backend == "openai":
-        if not a.model:
+    elif a.backend in ("openai", "fireworks"):
+        if a.backend == "openai" and not a.model:
             raise SystemExit("--model is required for the openai backend")
-        kw = {"model": a.model, "base_url": a.base_url, "endpoint": a.endpoint}
+        if a.model:
+            kw["model"] = a.model
+        if a.base_url:
+            kw["base_url"] = a.base_url
+        # Default to /completions on Fireworks so branching stays available;
+        # OpenAI's chat endpoint remains the default there.
+        kw["endpoint"] = a.endpoint or ("completions" if a.backend == "fireworks" else "chat")
+        if a.backend == "fireworks" and a.max_top_logprobs:
+            kw["max_top_logprobs"] = a.max_top_logprobs
     elif a.backend == "mock" and a.model:
         kw = {"model": a.model}
     return get_backend(a.backend, **kw)
@@ -161,32 +186,66 @@ def cmd_branch(a: argparse.Namespace) -> int:
 
 
 def cmd_corpus(a: argparse.Namespace) -> int:
-    prompts = load_prompts(a.prompts)
-    if not prompts:
-        raise SystemExit(f"no prompts found in {a.prompts}")
-    be = _make_backend(a)
-
-    def progress(i: int, n: int, _t: Any) -> None:
-        print(f"\r  generating {i}/{n}", end="", file=sys.stderr, flush=True)
-
-    res = run_corpus(
-        be, prompts,
-        samples_per_prompt=a.samples,
+    gate = dict(
         rank=a.rank,
         gated=bool(a.top_n or a.max_cost),
         gate_top_n=a.top_n,
         gate_max_cost=a.max_cost,
-        max_tokens=a.max_tokens,
-        temperature=a.temperature,
-        top_p=a.top_p,
-        candidates=a.candidates,
-        system=a.system,
-        seed0=a.seed,
         lex=_make_lex(a),
         n_iter=a.permutations,
-        on_progress=progress,
+        seed=a.seed,
     )
-    print(file=sys.stderr)
+
+    if a.from_traces:
+        # Re-analysis only: no generation, no cost. This is the correct path
+        # for rank and gating sweeps -- it guarantees every setting is
+        # compared on the *same* traces, preserving the pairing.
+        traces = load_traces(a.from_traces)
+        print(f"analysing {len(traces)} existing traces (no generation)", file=sys.stderr)
+        res = analyse_traces(traces, **gate)
+    else:
+        prompts = load_prompts(a.prompts) if a.prompts else []
+        if not prompts:
+            raise SystemExit("need --prompts (to generate) or --from-traces (to re-analyse)")
+        be = _make_backend(a)
+        if a.concurrency > 1 and a.backend == "hf":
+            print(
+                "warning: --concurrency > 1 is unsafe for a single local hf model; "
+                "forcing 1", file=sys.stderr,
+            )
+            a.concurrency = 1
+
+        def progress(i: int, n: int, _t: Any) -> None:
+            print(f"\r  generating {i}/{n}", end="", file=sys.stderr, flush=True)
+
+        traces = generate_traces(
+            be, prompts,
+            samples_per_prompt=a.samples,
+            max_tokens=a.max_tokens,
+            temperature=a.temperature,
+            top_p=a.top_p,
+            candidates=a.candidates,
+            system=a.system,
+            seed0=a.seed,
+            concurrency=a.concurrency,
+            on_progress=progress,
+        )
+        print(file=sys.stderr)
+        res = analyse_traces(
+            traces,
+            config={
+                "n_prompts": len(prompts),
+                "samples_per_prompt": a.samples,
+                "temperature": a.temperature,
+                "top_p": a.top_p,
+                "candidates": a.candidates,
+                "max_tokens": a.max_tokens,
+                "seed0": a.seed,
+                "concurrency": a.concurrency,
+            },
+            **gate,
+        )
+
     print(res.summary())
     paths = save_corpus(res, a.out)
     print("\nwrote: " + ", ".join(paths.values()))
@@ -243,7 +302,18 @@ def build_parser() -> argparse.ArgumentParser:
     b.set_defaults(fn=cmd_branch)
 
     c = sub.add_parser("corpus", help="corpus run with paired statistics")
-    c.add_argument("--prompts", required=True)
+    c.add_argument("--prompts", default=None, help="prompt file (omit with --from-traces)")
+    c.add_argument(
+        "--from-traces",
+        default=None,
+        help="re-analyse an existing traces.jsonl instead of generating. "
+        "Use this for rank/gating sweeps so every setting is compared on "
+        "identical traces (and costs nothing).",
+    )
+    c.add_argument(
+        "--concurrency", type=int, default=1,
+        help="parallel generation requests; safe for hosted APIs, not for local hf",
+    )
     c.add_argument("--samples", type=int, default=4)
     c.add_argument("--rank", type=int, default=1)
     c.add_argument("--top-n", type=int, default=None)
