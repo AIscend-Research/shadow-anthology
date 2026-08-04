@@ -48,11 +48,32 @@ won. That rules out most chat APIs.
 
 | Backend | Depth | Branching | Notes |
 |---|---|---|---|
-| `hf` | full top-k | ✅ | local weights. Exact, seedable, unlimited rank depth. The reference backend. |
-| `fireworks` | **5** (default) | ✅ | **best hosted option** — see below |
+| `hf` **(default)** | full top-k | ✅ | local weights. Exact, seedable, unlimited rank depth, free. **The only backend measured to work end to end.** |
+| `fireworks` | ~5 | endpoint-dependent | hosted, but see the finding below — the catalogue tested could not support the method |
 | `openai` | 20 | chat ✗ / completions ✅ | returns raw model logprobs, not the tempered sampling distribution |
 | `mock` | full | ✅ | dependency-free fixture for tests and the demo |
 | `anthropic` | — | — | **not possible**, raises with an explanation |
+
+### Measured finding: hosted reasoning models cannot be traced
+
+Probing all 18 generative models on one Fireworks account (2026): three return
+no logprobs at all, and **every** remaining one is a reasoning model. That is
+fatal in a non-obvious way. A reasoning model composes the poem *inside its
+chain of thought* and then transcribes it, so the poem you receive is a copy:
+
+| span | mean entropy | mean margin | off-argmax |
+|---|---|---|---|
+| reasoning | 0.999 bits | 2.77 nats | 28.5% |
+| **poem** | **0.056 bits** | **8.65 nats** | **0.0%** |
+
+The sampler made no choices in the poem span. Reconstructing its "rejected"
+tokens would mean reporting alternatives that were never in contention. The
+run aborts on this now (`entropy < 0.15 bits`) rather than producing a
+confident, meaningless result.
+
+This sharpens the agency argument rather than blocking it: it is not only that
+providers *withhold* the choice record, it is that an architecture can move
+the real choosing somewhere the API never exposes.
 
 ### Anthropic / Claude — why not
 
@@ -66,98 +87,50 @@ credit the sampler exists at generation time in every deployed system, and is
 discarded before display.** Where a provider withholds it, the sampler's
 authorship cannot be read at all.
 
-### Fireworks — the best hosted option
+### Fireworks — hosted, with caveats
 
 ```bash
 export FIREWORKS_API_KEY=...
-python -m shadow_anthology.cli trace \
-  --backend fireworks \
-  --model accounts/fireworks/models/llama-v3p1-8b-instruct \
-  --prompt "Write a short poem about winter light on water." \
-  --candidates 5 --temperature 1.0 --top-p 0.95 --out trace.json
+bash scripts/find_poet.sh          # probe every model: logprobs? verse or reasoning?
+BACKEND=fireworks bash scripts/run_all.sh
 ```
 
-Two advantages over the OpenAI API:
+Genuine advantages when a suitable model exists: it returns **`sampling_logprob`**
+alongside `logprob` — the *tempered* distribution the sampler drew from, which is
+exactly what this project measures and which OpenAI does not expose (traces record
+which you got in `meta.logprobs_are_raw`). Its `/completions` endpoint also takes a
+raw prompt, so a forced prefix is just a string and branching works.
 
-- it returns **`sampling_logprob`** alongside `logprob` — the *tempered*
-  distribution the sampler actually drew from, which is exactly the quantity
-  this project is about. Ranks therefore reflect the sampler's real preferences
-  rather than the model's untempered ones. (Traces record which you got in
-  `meta.logprobs_are_raw`.)
-- its `/completions` endpoint over open-weights models takes a raw prompt, so a
-  forced prefix is just a string — **branching works**.
-
-**Constraint:** `top_logprobs` is capped by the deployment's `--max-logprobs`,
-default **5**. That is the chosen token plus ~4 alternatives: enough for rank-1
-through rank-3 shadows, not enough for deep-rank anthologies. Raise it on a
-dedicated deployment and pass `max_top_logprobs=` to match. Requests above the
-cap are clamped and flagged in `meta.server_capped_candidates`, never silently
-honoured.
-
-Note the `completions` endpoint does no chat templating — format instruct-model
-prompts yourself, or use `--endpoint chat` and give up branching.
+Constraints: `top_logprobs` is capped by the deployment's `--max-logprobs`
+(default **5** — chosen token plus ~4 alternatives, enough for rank-1..3);
+requests above it are clamped and flagged in `meta.server_capped_candidates`,
+never silently honoured. `/completions` does no chat templating, so format
+instruct prompts yourself or use `--endpoint chat` and give up branching. And
+on the catalogue tested, no model cleared the reasoning problem above.
 
 ---
 
 ## Experiments
 
-The analysis pipeline is complete and tested. **No real model has been run yet**
-— everything below is ready to execute against `fireworks` or `hf`.
-
-Only **E1, E3 and E5 generate anything**. E2 and E4 are re-analyses of traces
-already on disk — they cost nothing and, more importantly, *must* reuse the same
-traces: regenerating per rank would compare rank 1 against rank 2 across
-different poems and silently destroy the pairing the whole design rests on.
-
 ```bash
-FW="--backend fireworks --model accounts/fireworks/models/llama-v3p1-8b-instruct"
-
-# E1 — main corpus: poem vs rank-1 shadow, paired tests over 16 prompts.  [GENERATES]
-python -m shadow_anthology.cli corpus --prompts prompts/poems.txt $FW \
-  --samples 8 --candidates 5 --temperature 1.0 --concurrency 8 --out runs/T1.0
-
-# E2 — rank depth: does divergence grow monotonically with rank?          [FREE]
-for r in 1 2 3; do
-  python -m shadow_anthology.cli corpus --from-traces runs/T1.0/traces.jsonl \
-    --rank $r --out runs/rank$r
-done
-
-# E3 — temperature sweep: how much of the poem is the sampler?            [GENERATES]
-for t in 0.3 0.7 1.3; do    # T=1.0 is E1 above, don't regenerate it
-  python -m shadow_anthology.cli corpus --prompts prompts/poems.txt $FW \
-    --samples 8 --candidates 5 --temperature $t --concurrency 8 --out runs/T$t
-done
-
-# E4 — gated vs full shadow                                               [FREE]
-python -m shadow_anthology.cli corpus --from-traces runs/T1.0/traces.jsonl \
-  --top-n 12 --out runs/gated
-
-# E5 — branching anthology: poems the model would have written            [GENERATES]
-python -m shadow_anthology.cli trace --prompt "Write a short poem about salt." \
-  $FW --candidates 5 --out trace.json
-python -m shadow_anthology.cli branch --trace trace.json $FW \
-  --points 8 --ranks 1 2 --budget 24 --out anthology.json
+pip install -e '.[hf,dev]'
+bash scripts/get_norms.sh                  # once
+SAMPLES=2 PERM=2000 bash scripts/run_all.sh   # validate (~5 min)
+SAMPLES=16 bash scripts/run_all.sh            # full suite
 ```
 
-### Cost and runtime
+Only **E1, E3 and E5 generate**. E2 and E4 re-analyse traces already on disk —
+free, and *required* to work that way: regenerating per rank would compare rank 1
+against rank 2 across different poems and silently destroy the pairing the whole
+design rests on.
 
-536 generations at 160 max output tokens ≈ **0.10M tokens**. An 8B model sits in
-the Fireworks 4B–16B serverless band at **$0.20/1M tokens**, so the whole suite
-is about **2 cents**. Cost is not a constraint here — even 64 samples/prompt is
-~16¢ — so size the run for statistical power, not for budget.
-
-| samples/prompt | generations | tokens | cost |
-|---|---|---|---|
-| 8 | 536 | 0.10M | $0.02 |
-| 16 | 1,048 | 0.20M | $0.04 |
-| 32 | 2,072 | 0.39M | $0.08 |
-| 64 | 4,120 | 0.78M | $0.16 |
-
-Wall-clock is the real cost, and it's all generation latency. At a rough
-100–300 tok/s for a serverless 8B: **7–13 min serial**, or **under 2 min at
-`--concurrency 8`**. Parallel generation is a pure speedup — traces come back in
-grid order with seeds unchanged, asserted by a test — but it is unsafe for a
-local `hf` model, where the CLI forces concurrency back to 1.
+| | what | generates? |
+|---|---|---|
+| **E1** | main corpus, T=1.0, poem vs rank-1 shadow | yes |
+| **E2** | rank depth 1/2/3 — does divergence grow monotonically? | no, reuses E1 |
+| **E3** | temperature sweep 0.3/0.7/1.0/1.3 | yes |
+| **E4** | gated shadow — only the 12 closest calls swapped | no, reuses E1 |
+| **E5** | branching anthology + HTML reading page | yes |
 
 **E3 is the load-bearing one.** `offrank_fraction` — the share of positions where
 the sampler did *not* take the model's preferred token — is the sampler's
@@ -165,16 +138,43 @@ editorial footprint, and it is zero under greedy decoding by construction. How i
 and the poem/shadow effect sizes move together across temperature is the direct
 measurement of how much of the poem belongs to the draw rather than the model.
 
-### Use real lexical norms
+The runner refuses to produce a meaningless corpus: the smoke test validates its
+own output before E1, a sanity gate aborts if the corpus is prose or reasoning
+rather than verse, and a deterministic-span check stops runs where the sampler
+had no real choices to make.
 
-The built-in lexicons are **seeds for demonstration only**, and every result is
-stamped `seed_lexicons: true` until you replace them. Before reporting anything:
+### Lexical norms — required
 
 ```bash
---concreteness-csv Concreteness_ratings_Brysbaert_et_al_BRM.csv \
---vad-csv Ratings_Warriner_et_al.csv \
---frequency-csv SUBTLEXus.csv
+bash scripts/get_norms.sh     # ~5MB, once
 ```
+
+Fetches Brysbaert concreteness (39,954 lemmas) and Warriner valence/arousal
+(13,915 lemmas); word frequency is derived from the SUBTLEX counts shipped inside
+the concreteness file, so there is no third download. `data/norms/` is picked up
+automatically — no flags — and overridable with `--concreteness-csv` / `--vad-csv`
+/ `--frequency-csv`.
+
+**Not optional.** Without them the seed lexicons cover too little real vocabulary
+and the coverage guard drops every pair: concreteness, imagery, valence and
+arousal all report `n=0`, leaving only the lexical-risk half of the study. With
+them, coverage on generated poetry runs ~82% concreteness and ~42%
+valence/arousal. Every result carries `seed_lexicons: true/false`, so
+demonstration numbers can never be mistaken for norm-backed ones.
+
+### Cost and runtime
+
+Local (`BACKEND=hf`, the default) costs **nothing** and runs on CPU/MPS. Expect
+roughly **1–1.5 hours** for all four arms at `SAMPLES=16` — there is no API
+concurrency, since one torch module cannot serve parallel generate loops. Use
+`SAMPLES=8` (~40 min) or `Qwen/Qwen2.5-0.5B-Instruct` (2–3× faster, weaker verse)
+if that is too slow; since cost is zero, `SAMPLES=32` is equally viable if you can
+leave it running.
+
+Hosted (`BACKEND=fireworks`) is minutes rather than hours at `--concurrency 8`,
+and cents rather than dollars — an 8B-class model sits in the $0.20/1M band, so
+the full suite is well under $1 even with reasoning tokens. The blocker there is
+model availability, not price.
 
 ---
 
@@ -212,10 +212,12 @@ either is better.
 ## Install
 
 ```bash
-pip install -e .                 # core: zero dependencies
-pip install -e '.[hf]'           # local models (torch + transformers)
+pip install -e '.[hf,dev]'       # local models (torch + transformers) + pytest
+bash scripts/get_norms.sh        # psycholinguistic norms, ~5MB
+pytest                           # 53 tests
+
+pip install -e .                 # core only: zero dependencies, mock backend
 pip install -e '.[openai]'       # hosted endpoints (httpx) — incl. Fireworks
-pip install -e '.[dev]' && pytest
 ```
 
 ## Library

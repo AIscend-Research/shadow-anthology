@@ -87,12 +87,30 @@ def _make_backend(a: argparse.Namespace) -> Any:
     return get_backend(a.backend, **kw)
 
 
+DEFAULT_NORMS = {
+    "concreteness": "data/norms/concreteness.txt",
+    "vad": "data/norms/warriner_vad.csv",
+}
+
+
 def _make_lex(a: argparse.Namespace) -> Lexicons:
-    if any([a.concreteness_csv, a.vad_csv, a.frequency_csv]):
-        return Lexicons.load(
-            concreteness=a.concreteness_csv, vad=a.vad_csv, frequency=a.frequency_csv
+    """Published norms if available, seed lexicons otherwise.
+
+    Falls back to `data/norms/` automatically so a normal run is norm-backed
+    without extra flags. Whether it succeeded is stamped on every result as
+    `seed_lexicons`, so the distinction is never lost.
+    """
+    conc = a.concreteness_csv or DEFAULT_NORMS["concreteness"]
+    vad = a.vad_csv or DEFAULT_NORMS["vad"]
+    lex = Lexicons.load(concreteness=conc, vad=vad, frequency=a.frequency_csv)
+    if lex.is_seed:
+        print(
+            "warning: no published norms found (looked in data/norms/). "
+            "Imagery and tone will be scored with SEED lexicons and will "
+            "mostly report n=0. Run: bash scripts/get_norms.sh",
+            file=sys.stderr,
         )
-    return Lexicons.seed()
+    return lex
 
 
 # -- commands --------------------------------------------------------------

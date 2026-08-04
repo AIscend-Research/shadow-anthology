@@ -6,6 +6,7 @@ import math
 
 import pytest
 
+from shadow_anthology.lexicons import tokenize_words
 from shadow_anthology import (
     Lexicons,
     branch_anthology,
@@ -72,6 +73,38 @@ def test_repetition_detects_repeated_bigrams():
     rep = measure("the stone the stone the stone the stone")
     var = measure("the stone a river of bright salt and morning")
     assert rep.repetition > var.repetition
+
+
+def test_published_norms_load_and_cover_real_poetry():
+    """Skipped unless the norms are downloaded (scripts/get_norms.sh).
+
+    Guards the two format traps that silently produced 100% dropped pairs:
+    the Brysbaert file is TAB-separated (not CSV), and its frequency column is
+    raw SUBTLEX counts (not log-scaled).
+    """
+    import os
+
+    conc, vad = "data/norms/concreteness.txt", "data/norms/warriner_vad.csv"
+    if not (os.path.exists(conc) and os.path.exists(vad)):
+        pytest.skip("norms not downloaded")
+
+    lex = Lexicons.load(concreteness=conc, vad=vad)
+    assert not lex.is_seed
+    assert len(lex.concreteness) > 30_000
+    assert len(lex.valence) > 10_000
+    assert len(lex.frequency) > 30_000, "SUBTLEX counts must populate frequency"
+    assert lex.concreteness["stone"] > lex.concreteness["grief"]
+    assert lex.valence["honey"] > lex.valence["grief"]
+    # log-transformed, not raw counts
+    assert 0.0 <= lex.frequency["the"] <= 8.0
+
+    poem = "a pinch of white\nfrom earth deep crust\na taste of tears"
+    cov = lex.coverage(tokenize_words(poem))
+    assert cov["concreteness"] > 0.5, "real poetry must clear the coverage gate"
+
+    m = measure(poem, lex=lex)
+    assert m.concreteness is not None and m.imagery is not None
+    assert m.seed_lexicons is False
 
 
 def test_seed_lexicon_flag_is_propagated():

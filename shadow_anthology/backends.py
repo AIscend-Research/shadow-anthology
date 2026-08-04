@@ -187,6 +187,18 @@ class HFBackend:
         self.lm = AutoModelForCausalLM.from_pretrained(model, **kwargs).to(device)
         self.lm.eval()
 
+        # Every id that ends a turn. Chat models stop on a template token
+        # (<|im_end|>) that is not the tokenizer's eos_token_id, so stopping on
+        # eos alone leaves the marker in the text.
+        self._stop_ids = {
+            i for i in (
+                self.tokenizer.eos_token_id,
+                self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+                self.tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                self.tokenizer.convert_tokens_to_ids("<|eot_id|>"),
+            ) if isinstance(i, int) and i >= 0
+        }
+
     # -- helpers ------------------------------------------------------------
 
     def _encode(self, text: str) -> list[int]:
@@ -297,6 +309,13 @@ class HFBackend:
                     )
                     cands.sort(key=lambda c: -c.logprob)
 
+                # Stop BEFORE recording end-of-turn. Including it would put the
+                # literal special token (e.g. "<|im_end|>") into the poem text,
+                # where it corrupts word counts and lexicon coverage and shows
+                # up verbatim in the rendered artifact.
+                if eos is not None and nxt in self._stop_ids:
+                    break
+
                 rank = next(j for j, c in enumerate(cands) if c.token_id == nxt)
                 steps.append(
                     TokenStep(
@@ -308,9 +327,6 @@ class HFBackend:
                 )
                 ids.append(nxt)
                 cur = torch.tensor([[nxt]], device=self.device)
-
-                if eos is not None and nxt == eos:
-                    break
                 text_so_far = "".join(s.chosen.text for s in steps)
                 if stop and any(s in text_so_far for s in stop):
                     break

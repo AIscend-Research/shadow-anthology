@@ -21,6 +21,7 @@ when coverage is too low to mean anything.
 from __future__ import annotations
 
 import csv
+import math
 import os
 import re
 from dataclasses import dataclass, field

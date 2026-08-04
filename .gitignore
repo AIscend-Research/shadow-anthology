@@ -4,6 +4,9 @@
 *.key
 secrets.*
 
+# downloaded norms (5MB; fetch with scripts/get_norms.sh)
+data/norms/
+
 # experiment output (traces are large; regenerate from seeds instead)
 runs/
 *.jsonl
