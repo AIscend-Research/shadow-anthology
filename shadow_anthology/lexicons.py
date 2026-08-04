@@ -144,21 +144,41 @@ class Lexicons:
     ) -> "Lexicons":
         """Overlay published norms onto the seed lexicons.
 
-        Column names follow the standard public releases; anything unparseable
-        is skipped rather than guessed at.
+        Handles the real distributed formats: the Brysbaert concreteness file
+        is TAB-separated, the Warriner VAD file is comma-separated, and the
+        delimiter is sniffed per file rather than assumed. Column names follow
+        the standard public releases; anything unparseable is skipped rather
+        than guessed at.
+
+        The concreteness release also carries a raw `SUBTLEX` count column,
+        which is log10-transformed here to serve as the frequency resource --
+        so a separate SUBTLEX download is optional. An explicitly passed
+        `frequency` file takes precedence.
         """
         lex = base or cls.seed()
         loaded_any = False
 
         if concreteness and os.path.exists(concreteness):
             lex.concreteness.update(_read_csv(concreteness, "Word", "Conc.M"))
+            counts = _read_csv(concreteness, "Word", "SUBTLEX")
+            if counts:
+                # counts -> log10(count+1), the same scale as SUBTLEX's Lg10WF
+                lex.frequency.update(
+                    {w: math.log10(c + 1.0) for w, c in counts.items()}
+                )
             loaded_any = True
         if vad and os.path.exists(vad):
             lex.valence.update(_read_csv(vad, "Word", "V.Mean.Sum"))
             lex.arousal.update(_read_csv(vad, "Word", "A.Mean.Sum"))
             loaded_any = True
         if frequency and os.path.exists(frequency):
-            lex.frequency.update(_read_csv(frequency, "Word", "Lg10WF"))
+            freq = _read_csv(frequency, "Word", "Lg10WF")
+            if not freq:  # a raw-count release rather than a log one
+                freq = {
+                    w: math.log10(c + 1.0)
+                    for w, c in _read_csv(frequency, "Word", "FREQcount").items()
+                }
+            lex.frequency.update(freq)
             loaded_any = True
 
         lex.is_seed = not loaded_any
@@ -191,13 +211,23 @@ class Lexicons:
 
 
 def _read_csv(path: str, wcol: str, vcol: str) -> dict[str, float]:
+    """Read a word->value column pair, sniffing the delimiter.
+
+    The published norm files disagree: Brysbaert concreteness ships as TSV,
+    Warriner VAD as CSV. Assuming a comma silently yields one giant column and
+    an empty lexicon, which then shows up as 100% dropped pairs rather than as
+    an error --- so the delimiter is detected from the header.
+    """
     out: dict[str, float] = {}
     with open(path, newline="", encoding="utf-8", errors="replace") as fh:
-        for row in csv.DictReader(fh):
+        head = fh.readline()
+        fh.seek(0)
+        delim = "\t" if head.count("\t") > head.count(",") else ","
+        for row in csv.DictReader(fh, delimiter=delim):
             w = (row.get(wcol) or "").strip().lower()
             try:
                 v = float(row.get(vcol) or "")
-            except ValueError:
+            except (ValueError, TypeError):
                 continue
             if w:
                 out[w] = v

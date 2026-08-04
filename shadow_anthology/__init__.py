@@ -12,7 +12,7 @@ runnable end-to-end example with no dependencies.
 """
 
 from .anthology import Anthology, Branch, branch_anthology
-from .backends import Backend, BackendUnsupported, get_backend
+from .backends import APIRequestFailed, Backend, BackendUnsupported, get_backend
 from .corpus import (
     CorpusResult,
     analyse_traces,
@@ -39,7 +39,7 @@ from .trace import Candidate, GenerationTrace, TokenStep, load_traces, save_trac
 __version__ = "0.1.0"
 
 __all__ = [
-    "Anthology", "Backend", "BackendUnsupported", "Branch", "Candidate",
+    "APIRequestFailed", "Anthology", "Backend", "BackendUnsupported", "Branch", "Candidate",
     "Comparison", "CorpusResult", "GenerationTrace", "Lexicons", "PoemMetrics",
     "ShadowPoem", "Substitution", "TestResult", "TokenStep", "branch_anthology",
     "coin_flips", "compare", "divergence_profile", "gated_shadow", "get_backend",

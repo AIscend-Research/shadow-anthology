@@ -96,11 +96,23 @@ class TokenStep:
         return min(1.0, sum(c.prob for c in self.candidates))
 
     def alternatives(self) -> list[Candidate]:
-        """Candidates other than the chosen one, best-first.
+        """Candidates that would render differently, best-first.
 
         `alternatives()[0]` is *the* nearest-rejected token: the shadow.
+
+        Candidates whose text is identical to the chosen token's are excluded,
+        not merely the chosen index. Real tokenizers routinely carry several
+        distinct token ids that decode to the same string, and one of those
+        surfacing as the "runner-up" produces a substitution that changes
+        nothing on the page --- an invisible divergence that would still be
+        counted, inflating the substitution rate and diluting every measured
+        poem-vs-shadow difference toward zero.
         """
-        return [c for i, c in enumerate(self.candidates) if i != self.chosen_rank]
+        return [
+            c
+            for i, c in enumerate(self.candidates)
+            if i != self.chosen_rank and c.text != self.chosen.text
+        ]
 
     def alternative(self, rank: int = 1) -> Candidate | None:
         """The `rank`-th rejected token (1 = runner-up, 2 = third choice, ...)."""
@@ -188,6 +200,79 @@ class GenerationTrace:
     def prefix_text(self, upto: int) -> str:
         """The generated text up to (not including) step `upto`."""
         return "".join(s.chosen.text for s in self.steps[:upto])
+
+    def slice_steps(self, start: int, end: int | None = None) -> "GenerationTrace":
+        """A new trace over `steps[start:end]`, re-indexed from zero.
+
+        The per-position decision record is unchanged --- each step keeps the
+        candidates the sampler actually saw, which were conditioned on the full
+        preceding context. Only which positions we *analyse* changes.
+
+        This is what makes reasoning models usable: their visible output is
+        chain-of-thought followed by the answer, and slicing to the answer span
+        lets us measure the poem's decisions without the monologue's.
+        """
+        sub = self.steps[start:end]
+        steps = [
+            TokenStep(
+                index=i,
+                chosen=s.chosen,
+                candidates=s.candidates,
+                chosen_rank=s.chosen_rank,
+            )
+            for i, s in enumerate(sub)
+        ]
+        return GenerationTrace(
+            text="".join(s.chosen.text for s in steps),
+            steps=steps,
+            prompt=self.prompt,
+            model=self.model,
+            backend=self.backend,
+            params=dict(self.params),
+            system=self.system,
+            seed=self.seed,
+            meta={**self.meta, "sliced_from": [start, end], "original_len": len(self)},
+        )
+
+    def marker_spans(self, marker: str) -> list[tuple[int, int]]:
+        """Step spans of every occurrence of `marker`, as (start, end_exclusive).
+
+        Matching is on accumulated text, not token boundaries, since a marker is
+        usually split across several tokens and rarely aligns with any of them.
+        `end` is the first step index *after* the marker finishes --- i.e. where
+        the text following it begins.
+        """
+        if not marker:
+            return []
+        # char offset at which each step's text begins
+        offsets, acc = [], 0
+        for s in self.steps:
+            offsets.append(acc)
+            acc += len(s.chosen.text)
+        text = self.text if len(self.text) == acc else "".join(
+            s.chosen.text for s in self.steps
+        )
+
+        def step_of(char_i: int) -> int:
+            lo, hi = 0, len(offsets) - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if offsets[mid] <= char_i:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo
+
+        spans, at = [], text.find(marker)
+        while at != -1:
+            spans.append((step_of(at), min(len(self.steps), step_of(at + len(marker)) + 1)))
+            at = text.find(marker, at + len(marker))
+        return spans
+
+    def find_marker(self, marker: str) -> int | None:
+        """First step index *after* `marker` finishes, or None if absent."""
+        spans = self.marker_spans(marker)
+        return spans[0][1] if spans else None
 
     # ---- serialisation -----------------------------------------------------
 

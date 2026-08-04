@@ -74,6 +74,53 @@ class BackendUnsupported(RuntimeError):
     pass
 
 
+class APIRequestFailed(RuntimeError):
+    """An HTTP error that carries the server's own explanation.
+
+    Written after a debugging session in which a bare `404 Not Found` sent us
+    hunting the endpoint URL, when the body said `model not found` and the
+    real problem was an invalid key two calls away. The status code alone is
+    close to useless on these APIs; the body is where the answer is.
+
+    Note in particular that Fireworks resolves the model *before* checking
+    auth, so an unknown model returns 404 whether or not your key is valid --
+    which is why the hint below never claims the key is fine.
+    """
+
+    HINTS = {
+        401: (
+            "The key was rejected. Check FIREWORKS_API_KEY is set to the FULL "
+            "key (they are long; a truncated copy is the usual cause), and that "
+            "it has not been revoked."
+        ),
+        403: "The key is valid but not permitted to use this model or account.",
+        404: (
+            "The model id was not found, is not deployed, or your account "
+            "cannot reach it. NOTE: this check runs BEFORE authentication, so a "
+            "404 here does not tell you whether your key is valid -- verify "
+            "that separately against a models/list endpoint."
+        ),
+        429: "Rate limited. Lower --concurrency or retry.",
+    }
+
+    def __init__(self, status: int, body: str, model: str = "?") -> None:
+        self.status = status
+        self.body = body
+        detail = body.strip()
+        try:
+            import json as _json
+
+            parsed = _json.loads(body)
+            detail = parsed.get("error", {}).get("message", detail) or detail
+        except Exception:
+            pass
+        hint = self.HINTS.get(status, "")
+        super().__init__(
+            f"HTTP {status} from the API (model={model!r}): {detail[:400]}"
+            + (f"\n  -> {hint}" if hint else "")
+        )
+
+
 class AnthropicUnsupported:
     """Placeholder that documents why Claude cannot be traced this way.
 
@@ -416,7 +463,8 @@ class OpenAICompatBackend:
         r = self._httpx.post(
             f"{self.base_url}{path}", json=body, headers=headers, timeout=120.0
         )
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise APIRequestFailed(r.status_code, r.text, body.get("model", "?"))
         return r.json()
 
     def _steps_from_logprobs(self, content: list[dict[str, Any]]) -> list[TokenStep]:
@@ -430,19 +478,35 @@ class OpenAICompatBackend:
         """
         steps: list[TokenStep] = []
         for i, item in enumerate(content):
-            tops = item.get("top_logprobs") or []
-            cands = [_candidate_from(t) for t in tops]
+            tops = list(item.get("top_logprobs") or [])
 
-            chosen_text = item["token"]
-            chosen = _candidate_from(item)
-            if not any(
-                c.text == chosen.text and c.logprob == chosen.logprob for c in cands
-            ):
+            # Scale consistency. The chosen entry often carries
+            # `sampling_logprob` while the top_logprobs entries carry only the
+            # raw `logprob`. Ranking a tempered value against raw ones compares
+            # different units and corrupts chosen_rank, so use the tempered
+            # scale only when EVERY entry at this position has it.
+            use_sampling = all(
+                x.get("sampling_logprob") is not None for x in [item] + tops
+            )
+            cands = [_candidate_from(t, use_sampling) for t in tops]
+            chosen = _candidate_from(item, use_sampling)
+
+            # Dedup by token id where the server gives one, falling back to
+            # surface text. Comparing logprobs here (the previous approach)
+            # appended a second copy of the chosen token whenever the two
+            # sources reported it on different scales -- which then surfaced as
+            # its own "runner-up", identical on the page, at 76% of positions.
+            def same(a: Candidate, b: Candidate) -> bool:
+                if a.token_id >= 0 and b.token_id >= 0:
+                    return a.token_id == b.token_id
+                return a.text == b.text
+
+            if not any(same(c, chosen) for c in cands):
                 cands.append(chosen)
 
             cands.sort(key=lambda c: -c.logprob)
             rank = next(
-                (j for j, c in enumerate(cands) if c.text == chosen_text),
+                (j for j, c in enumerate(cands) if same(c, chosen)),
                 0,
             )
             steps.append(
@@ -483,24 +547,31 @@ class OpenAICompatBackend:
             body["stop"] = list(stop)
 
         if self.endpoint == "completions":
-            # The legacy completions shape reports logprobs as parallel arrays
-            # with `top_logprobs` as a token->logprob mapping per position.
             body["prompt"] = prompt if system is None else f"{system}\n\n{prompt}"
-            body["logprobs"] = eff
+            # `logprobs` stays boolean here. Sending the integer form alongside
+            # `top_logprobs` is rejected ("logprobs must be a True if
+            # top_logprobs is set"), and the boolean form is also the one that
+            # returns `sampling_logprob`, which is the field we actually want.
             data = self._post("/completions", body)
             choice = data["choices"][0]
             lp = choice["logprobs"]
-            tops = lp.get("top_logprobs") or [None] * len(lp["tokens"])
-            content = [
-                {
-                    "token": t,
-                    "logprob": l,
-                    "top_logprobs": [
-                        {"token": k, "logprob": v} for k, v in (d or {}).items()
-                    ],
-                }
-                for t, l, d in zip(lp["tokens"], lp["token_logprobs"], tops)
-            ]
+            if isinstance(lp, dict) and "content" in lp:
+                # OpenAI-shaped response (what the boolean form returns).
+                content = lp["content"]
+            else:
+                # Legacy shape: parallel arrays, `top_logprobs` a per-position
+                # token->logprob mapping. Kept for servers that only do this.
+                tops = lp.get("top_logprobs") or [None] * len(lp["tokens"])
+                content = [
+                    {
+                        "token": t,
+                        "logprob": l,
+                        "top_logprobs": [
+                            {"token": k, "logprob": v} for k, v in (d or {}).items()
+                        ],
+                    }
+                    for t, l, d in zip(lp["tokens"], lp["token_logprobs"], tops)
+                ]
             text = choice["text"]
         else:
             msgs = ([{"role": "system", "content": system}] if system else []) + [
@@ -758,18 +829,22 @@ _REGISTRY = {
 }
 
 
-def _candidate_from(item: Mapping[str, Any]) -> Candidate:
+def _candidate_from(item: Mapping[str, Any], use_sampling: bool = True) -> Candidate:
     """One candidate from an OpenAI/Fireworks logprobs entry.
 
-    `sampling_logprob` (post-temperature) is preferred for ranking when the
-    server provides it; `logprob` is retained as the raw model preference.
+    `sampling_logprob` (post-temperature) is what the sampler actually drew
+    from and is preferred for ranking --- but only when every candidate at the
+    position has it, since mixing the two scales is meaningless. The caller
+    decides that and passes `use_sampling`; `logprob` is always retained as
+    `raw_logprob`.
     """
     raw = float(item["logprob"])
     samp = item.get("sampling_logprob")
+    tid = item.get("token_id")
     return Candidate(
-        token_id=int(item.get("token_id", -1)),
+        token_id=int(tid) if tid is not None else -1,
         text=item["token"],
-        logprob=float(samp) if samp is not None else raw,
+        logprob=float(samp) if (use_sampling and samp is not None) else raw,
         raw_logprob=raw,
     )
 

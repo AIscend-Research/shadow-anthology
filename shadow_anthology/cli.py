@@ -17,7 +17,7 @@ import sys
 from typing import Any, Sequence
 
 from .anthology import branch_anthology
-from .backends import BackendUnsupported, get_backend
+from .backends import APIRequestFailed, BackendUnsupported, get_backend
 from .corpus import (
     analyse_traces,
     generate_traces,
@@ -124,6 +124,130 @@ def cmd_demo(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check(a: argparse.Namespace) -> int:
+    """Preflight: is the key valid, and is the model reachable?
+
+    These are checked separately and in that order, because the APIs conflate
+    them: Fireworks resolves the model before authenticating, so an unknown
+    model returns 404 even with a bad key. Diagnosing them together is how you
+    end up debugging the wrong one.
+    """
+    import httpx
+
+    key_env = {"fireworks": "FIREWORKS_API_KEY", "openai": "OPENAI_API_KEY"}.get(
+        a.backend
+    )
+    key = os.environ.get(key_env or "", "")
+    print(f"backend   {a.backend}")
+    print(f"{key_env or 'api key':<9} " + (f"set, {len(key)} chars" if key else "NOT SET"))
+    if not key:
+        print(f"\nFAIL: {key_env} is empty. Create a key and export it.")
+        return 2
+
+    base = a.base_url or (
+        "https://api.fireworks.ai/inference/v1"
+        if a.backend == "fireworks"
+        else "https://api.openai.com/v1"
+    )
+    hdr = {"Authorization": f"Bearer {key}"}
+
+    # 1. Auth, isolated from any model lookup.
+    try:
+        r = httpx.get(f"{base}/models", headers=hdr, timeout=30.0)
+    except Exception as e:
+        print(f"\nFAIL: could not reach {base}: {e}")
+        return 2
+    if r.status_code == 401:
+        print(f"\nFAIL: key rejected -- {r.text[:200]}")
+        print("  The whole key must be copied; they are long and easily truncated.")
+        return 2
+    if r.status_code >= 400:
+        print(f"\nWARN: /models returned {r.status_code}: {r.text[:200]}")
+    else:
+        print("auth      OK")
+
+    # 2. Model reachability, and what is actually available.
+    ids = []
+    try:
+        ids = [m["id"] for m in r.json().get("data", [])]
+    except Exception:
+        pass
+    if not a.model:
+        if ids:
+            print(f"\nModels available to this account ({len(ids)}):")
+            for m in ids[:40]:
+                print(f"  {m}")
+            print("\nRe-run with --model <id> to probe one for logprob support.")
+        return 0
+
+    print(f"model     {a.model} -- {'listed' if a.model in ids else 'NOT in /models'}")
+    if ids and a.model not in ids:
+        print("\n  Available to this account:")
+        for m in ids[:40]:
+            print(f"    {m}")
+        return 2
+
+    # 3. Live probe. Being listed is not enough: this method needs the losing
+    #    tokens, and plenty of served models return no logprobs at all. An
+    #    8-token generation settles it for a fraction of a cent.
+    print("\nprobing (8 tokens)...", flush=True)
+    ok_any = False
+    for endpoint in ([a.endpoint] if a.endpoint else ["chat", "completions"]):
+        try:
+            be = get_backend(
+                a.backend, model=a.model, endpoint=endpoint,
+                **({"max_top_logprobs": a.max_top_logprobs} if a.max_top_logprobs else {}),
+            )
+            t = be.generate_trace(
+                "Write a short poem about salt.", max_tokens=8, candidates=5,
+                temperature=1.0,
+            )
+        except (APIRequestFailed, BackendUnsupported) as e:
+            print(f"  {endpoint:<12} FAILED: {str(e).splitlines()[0]}", flush=True)
+            continue
+        except Exception as e:
+            # Anything else --- a timeout, or a response shape we cannot parse
+            # (some served models return no `logprobs` object at all). Report
+            # it as a probe result rather than a traceback: the point of this
+            # command is to answer "can this model be traced", and a crash
+            # answers that badly.
+            print(
+                f"  {endpoint:<12} FAILED: {type(e).__name__}: {str(e)[:160]}",
+                flush=True,
+            )
+            continue
+
+        from .corpus import REASONING_MARKERS
+        head = t.text.strip()[:80].lower()
+        preamble = any(m in head for m in REASONING_MARKERS)
+        n_alts = [len(s.candidates) for s in t.steps]
+        avg = sum(n_alts) / len(n_alts) if n_alts else 0
+        tempered = not t.meta.get("logprobs_are_raw", True)
+        usable = bool(t.steps) and avg >= 2
+        print(
+            f"  {endpoint:<12} {'OK ' if usable else 'NO '} "
+            f"{len(t.steps)} steps, {avg:.1f} candidates/step, "
+            f"{'sampling_logprob (tempered)' if tempered else 'raw logprob only'}",
+            flush=True,
+        )
+        print(f"      sample: {t.text.strip()[:70]!r}")
+        if preamble:
+            print("      -> WRITES PREAMBLE, not verse. A reasoning model's visible")
+            print("         output is its chain of thought; unusable as poems.")
+        if not usable:
+            print("      -> no runner-up tokens returned; this model cannot be traced")
+        else:
+            ok_any = True
+            if endpoint == "completions":
+                print("      -> branching available on this endpoint")
+
+    if not ok_any:
+        print("\nFAIL: this model does not expose usable logprobs. Try another.")
+        return 2
+    print("\nOK -- ready to run.")
+    return 0
+
+
 def cmd_trace(a: argparse.Namespace) -> int:
     be = _make_backend(a)
     t = be.generate_trace(
@@ -196,11 +320,29 @@ def cmd_corpus(a: argparse.Namespace) -> int:
         seed=a.seed,
     )
 
+    def maybe_slice(traces):
+        if not a.poem_marker:
+            return traces
+        from .corpus import slice_to_poem
+        kept, rep = slice_to_poem(traces, a.poem_marker)
+        print(
+            f"marker slice: kept {rep['kept']}/{rep['input_traces']} "
+            f"(no marker: {rep['dropped_no_marker']}, too short: "
+            f"{rep['dropped_too_short']})", file=sys.stderr,
+        )
+        if not kept:
+            raise SystemExit(
+                f"No trace contained {a.poem_marker!r}. The model never emitted "
+                "it -- check the system prompt, or raise --max-tokens so it has "
+                "room to finish thinking and write."
+            )
+        return kept
+
     if a.from_traces:
         # Re-analysis only: no generation, no cost. This is the correct path
         # for rank and gating sweeps -- it guarantees every setting is
         # compared on the *same* traces, preserving the pairing.
-        traces = load_traces(a.from_traces)
+        traces = maybe_slice(load_traces(a.from_traces))
         print(f"analysing {len(traces)} existing traces (no generation)", file=sys.stderr)
         res = analyse_traces(traces, **gate)
     else:
@@ -231,6 +373,7 @@ def cmd_corpus(a: argparse.Namespace) -> int:
             on_progress=progress,
         )
         print(file=sys.stderr)
+        traces = maybe_slice(traces)
         res = analyse_traces(
             traces,
             config={
@@ -277,6 +420,10 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--out", default=None)
     d.set_defaults(fn=cmd_demo)
 
+    k = sub.add_parser("check", help="preflight: validate the key and the model id")
+    _backend_args(k)
+    k.set_defaults(fn=cmd_check)
+
     t = sub.add_parser("trace", help="generate a poem and record the sampler trace")
     t.add_argument("--prompt", required=True)
     t.add_argument("--out", default="trace.json")
@@ -314,6 +461,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--concurrency", type=int, default=1,
         help="parallel generation requests; safe for hosted APIs, not for local hf",
     )
+    c.add_argument(
+        "--poem-marker", default=None,
+        help="analyse only the tokens AFTER this marker in each generation. "
+        "Use with reasoning models: let them think, ask for the marker, and "
+        "measure only the poem. Traces lacking it are dropped and reported.",
+    )
     c.add_argument("--samples", type=int, default=4)
     c.add_argument("--rank", type=int, default=1)
     c.add_argument("--top-n", type=int, default=None)
@@ -338,7 +491,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return int(args.fn(args))
-    except BackendUnsupported as e:
+    except (BackendUnsupported, APIRequestFailed) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 

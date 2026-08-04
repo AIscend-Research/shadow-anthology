@@ -1,0 +1,28 @@
+# secrets — never commit an API key
+.env
+.env.*
+*.key
+secrets.*
+
+# experiment output (traces are large; regenerate from seeds instead)
+runs/
+*.jsonl
+anthology.json
+trace.json
+*.html
+!docs/**/*.html
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# os
+.DS_Store

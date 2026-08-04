@@ -247,6 +247,60 @@ def test_corpus_finds_no_effect_on_a_structureless_fixture(be):
     assert not offenders, f"pipeline invented an effect on noise: {offenders}"
 
 
+def test_chosen_token_is_not_duplicated_across_logprob_scales():
+    """Regression, from a 256-pair run.
+
+    Fireworks reports the chosen token with `sampling_logprob` but its
+    `top_logprobs` copy with only the raw `logprob`. Deduping on logprob
+    equality therefore appended a second copy of the chosen token, which then
+    surfaced as its own runner-up -- a 'shadow' identical to the poem, at 76%
+    of positions. Dedup must key on token id, and one scale must be used for
+    the whole position.
+    """
+    from shadow_anthology.backends import OpenAICompatBackend
+
+    be = OpenAICompatBackend.__new__(OpenAICompatBackend)
+    content = [{
+        "token": " request", "logprob": -0.326, "sampling_logprob": -0.313, "token_id": 5118,
+        "top_logprobs": [
+            {"token": " request", "logprob": -0.326, "token_id": 5118},
+            {"token": " poetry", "logprob": -1.326, "token_id": 19106},
+        ],
+    }]
+    step = be._steps_from_logprobs(content)[0]
+    assert [c.token_id for c in step.candidates].count(5118) == 1
+    assert step.alternative(1).text == " poetry"
+    # mixed scales would leave the chosen at a different value than its own
+    # top_logprobs entry; with one scale they agree
+    assert step.chosen.logprob == pytest.approx(-0.326)
+
+
+def test_alternatives_skip_tokens_that_render_identically():
+    """A rejected token that prints the same changes nothing on the page and
+    must not be counted as a divergence."""
+    from shadow_anthology.trace import Candidate, TokenStep
+
+    cands = [
+        Candidate(1, " it", -0.5, -0.5),
+        Candidate(2, " it", -0.6, -0.6),   # different id, same surface
+        Candidate(3, " that", -1.2, -1.2),
+    ]
+    step = TokenStep(index=0, chosen=cands[0], candidates=cands, chosen_rank=0)
+    assert [c.text for c in step.alternatives()] == [" that"]
+    assert step.alternative(1).text == " that"
+
+
+def test_sanity_guard_flags_reasoning_preamble(be):
+    """A corpus of chains-of-thought must not be silently measured as poetry."""
+    from shadow_anthology.corpus import sanity_warnings, text_sanity
+
+    traces = [be.generate_trace("x", max_tokens=10, seed=i) for i in range(4)]
+    for t in traces:
+        t.text = "Okay, the user wants a poem. I should focus on imagery. " * 4
+    warns = sanity_warnings(text_sanity(traces))
+    assert warns and any("reasoning-model preamble" in w for w in warns)
+
+
 def test_concurrency_does_not_change_results(be):
     """Parallel generation must be a pure speedup: same traces, same order."""
     from shadow_anthology.corpus import generate_traces

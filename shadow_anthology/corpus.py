@@ -37,12 +37,21 @@ class CorpusResult:
     traces: list[GenerationTrace] = field(default_factory=list, repr=False)
     shadows: list[ShadowPoem] = field(default_factory=list, repr=False)
     decision_stats: dict[str, float] = field(default_factory=dict)
+    sanity: dict[str, Any] = field(default_factory=dict)
+    """Whether these texts are plausibly poems at all. See `text_sanity`."""
     config: dict[str, Any] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
     """Per-metric count of pairs excluded for insufficient lexicon coverage."""
 
     def summary(self) -> str:
-        lines = [
+        warns = sanity_warnings(self.sanity)
+        lines = []
+        if warns:
+            lines += ["!" * 70, "CORPUS SANITY WARNING -- read before the statistics below:"]
+            for w in warns:
+                lines.append("  * " + w)
+            lines += ["!" * 70, ""]
+        lines += [
             f"shadow-anthology corpus: {len(self.comparisons)} poem/shadow pairs",
             f"  model={self.config.get('model')} backend={self.config.get('backend')} "
             f"rank={self.config.get('rank')} T={self.config.get('temperature')}",
@@ -69,6 +78,8 @@ class CorpusResult:
             "config": self.config,
             "n_pairs": len(self.comparisons),
             "decision_stats": self.decision_stats,
+            "sanity": self.sanity,
+            "sanity_warnings": sanity_warnings(self.sanity),
             "dropped": self.dropped,
             "tests": [t.to_dict() for t in self.tests],
             "comparisons": [c.to_dict() for c in self.comparisons],
@@ -198,6 +209,7 @@ def analyse_traces(
         )
 
     res.decision_stats = _decision_stats(res.traces, res.shadows)
+    res.sanity = text_sanity(res.traces)
     res.tests, res.dropped = _run_tests(res.comparisons, n_iter=n_iter, seed=seed)
     return res
 
@@ -305,6 +317,142 @@ def _decision_stats(
         ),
         "mean_shadow_divergence_rate": avg(lambda s: s.divergence_rate, shadows),
     }
+
+
+POEM_MARKER = "===POEM==="
+"""Delimiter we ask the model to emit between its reasoning and the poem.
+
+Every model on some providers' catalogues is a reasoning model whose visible
+output is its chain of thought. Rather than fight that, we let the model think
+and ask it to mark where the poem begins, then analyse only the poem's tokens.
+"""
+
+
+def slice_to_poem(
+    traces: Sequence[GenerationTrace],
+    marker: str = POEM_MARKER,
+    *,
+    min_tokens: int = 12,
+) -> tuple[list[GenerationTrace], dict[str, Any]]:
+    """Keep only the post-marker span of each trace.
+
+    Traces with no marker, or with too little text after it, are dropped
+    rather than analysed whole --- a trace whose marker never appeared is a
+    trace where the model never got to the poem, and including it would put
+    reasoning prose back into the corpus.
+
+    Returns (sliced_traces, report). The report is surfaced in the summary so
+    a high drop rate is visible instead of quietly shrinking the corpus.
+    """
+    kept: list[GenerationTrace] = []
+    no_marker = too_short = looped = 0
+    for t in traces:
+        spans = t.marker_spans(marker)
+        if not spans:
+            no_marker += 1
+            continue
+        start = spans[0][1]
+        # Models that loop re-emit the whole block. Cut at whichever loop
+        # signal comes FIRST: the next marker, or an echo of the system or
+        # user prompt. Cutting on the marker alone is not enough, because the
+        # repetition usually begins by echoing the prompt *before* reaching
+        # the marker again.
+        cuts = [s[0] for s in spans[1:]]
+        for echo in (t.system, t.prompt):
+            if not echo:
+                continue
+            probe = echo.strip()[:40]
+            if len(probe) < 12:
+                continue
+            cuts += [s[0] for s in t.marker_spans(probe) if s[0] > start]
+        end = min(cuts) if cuts else None
+        if cuts:
+            looped += 1
+        sub = t.slice_steps(start, end)
+        if len(sub) < min_tokens:
+            too_short += 1
+            continue
+        kept.append(sub)
+    return kept, {
+        "input_traces": len(traces),
+        "kept": len(kept),
+        "dropped_no_marker": no_marker,
+        "dropped_too_short": too_short,
+        "truncated_at_repeat": looped,
+        "marker": marker,
+    }
+
+
+REASONING_MARKERS = (
+    "okay,", "okay ", "hmm,", "the user wants", "the user is asking",
+    "i should", "i need to", "let me", "first, i", "we need to",
+    "this is a request", "let's ", "wait,",
+)
+
+
+def text_sanity(traces: Sequence[GenerationTrace]) -> dict[str, Any]:
+    """Is this corpus actually made of poems?
+
+    Written after a 256-pair run in which every "poem" turned out to be a
+    reasoning model's visible chain of thought, truncated before it wrote any
+    verse. The paired statistics were valid and meant nothing, because the
+    texts were not poems. A pipeline that can measure the wrong genre without
+    complaining is worse than one that crashes.
+    """
+    if not traces:
+        return {}
+    n = len(traces)
+    reasoning = json_like = truncated = 0
+    line_lens: list[float] = []
+
+    for t in traces:
+        head = t.text.strip()[:120].lower()
+        if any(m in head for m in REASONING_MARKERS):
+            reasoning += 1
+        if t.text.count('":') > 2 or t.text.count("{") > 2:
+            json_like += 1
+        cap = t.params.get("max_tokens")
+        if cap and len(t) >= cap:
+            truncated += 1
+        lines = [ln for ln in t.text.splitlines() if ln.strip()]
+        if lines:
+            line_lens.append(sum(len(ln) for ln in lines) / len(lines))
+
+    return {
+        "reasoning_preamble_rate": reasoning / n,
+        "json_like_rate": json_like / n,
+        "hit_token_cap_rate": truncated / n,
+        "mean_line_chars": sum(line_lens) / len(line_lens) if line_lens else 0.0,
+    }
+
+
+def sanity_warnings(s: dict[str, Any]) -> list[str]:
+    """Human-readable objections to treating this corpus as poetry."""
+    out = []
+    if s.get("reasoning_preamble_rate", 0) > 0.2:
+        out.append(
+            f"{s['reasoning_preamble_rate']:.0%} of texts open with reasoning-model "
+            "preamble ('Okay,', 'The user wants', 'I should'). These are chains of "
+            "thought, not poems -- the comparison below is measuring the wrong genre. "
+            "Use a non-reasoning model, or a system prompt that forbids preamble."
+        )
+    if s.get("json_like_rate", 0) > 0.2:
+        out.append(
+            f"{s['json_like_rate']:.0%} of texts look like JSON/structured data, not "
+            "verse. This is the signature of an untemplated completions prompt: the "
+            "base model continued your prompt as data rather than answering it."
+        )
+    if s.get("hit_token_cap_rate", 0) > 0.5:
+        out.append(
+            f"{s['hit_token_cap_rate']:.0%} of generations hit the max_tokens cap, so "
+            "the texts are truncated mid-thought rather than finished poems."
+        )
+    if s.get("mean_line_chars", 0) > 90:
+        out.append(
+            f"mean line length is {s['mean_line_chars']:.0f} characters -- that is "
+            "prose, not lineated verse."
+        )
+    return out
 
 
 def load_prompts(path: str) -> list[str]:
