@@ -391,6 +391,14 @@ def test_html_is_self_contained_and_themed(trace):
     assert "overflow-x:auto" in doc
 
 
+def test_html_has_no_control_characters(trace):
+    """Regression: CSS written as "\\00a0" in a Python string became a literal
+    NUL byte, which browsers rendered as visible garbage in the poem."""
+    doc = render_html(trace)
+    assert "\x00" not in doc
+    assert all(ord(c) >= 32 or c in "\n\t" for c in doc)
+
+
 def test_html_escapes_content(be):
     t = be.generate_trace("x", max_tokens=5, seed=1)
     t.text = "<script>alert(1)</script>"

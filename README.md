@@ -178,6 +178,48 @@ model availability, not price.
 
 ---
 
+## Results
+
+Qwen2.5-1.5B-Instruct, 16 prompts x 16 samples = 256 poems per arm, four
+temperatures, ranks 1-3, published norms. Full output in `runs/`.
+
+**1. How much of the poem is available to decide is itself a function of
+temperature.** This is the finding.
+
+| T | off-argmax | **positions with any alternative** | entropy |
+|---|---|---|---|
+| 0.3 | 12.7% | **47.3%** | 0.46 bits |
+| 0.7 | 33.3% | **81.2%** | 1.45 bits |
+| 1.0 | 48.2% | **92.6%** | 2.30 bits |
+| 1.3 | 59.7% | **97.1%** | 2.91 bits |
+
+At T=0.3 more than half the poem has no second candidate at all. Those tokens
+were not chosen over alternatives; they were the only thing in the sampler's
+support. The sampler's authorship does not merely weaken at low temperature --
+across most of the text it does not exist.
+
+**2. The poem and its nearest-rejected sibling do not differ in imagery or
+tone.** Every lexical difference that reaches significance is an artifact of
+probability rank, established by two controls:
+
+- `scripts/rank_control.py` — comparing the poem against rank-1, 2 and 3
+  shadows. Six of eleven metrics (rarity, repetition, risk, type-token ratio,
+  word length, concreteness) grow monotonically with rank, so they track how
+  far down the ranking you went, not what the sampler chose. `type_token_ratio`
+  and `mean_word_length` **reverse sign** between rank 1 and rank 2.
+- `scripts/across_arm_correction.py` — Holm and Benjamini-Hochberg over all 77
+  unique tests, not 11 per arm. `valence` and `arousal`, the only imagery/tone
+  metrics that reached significance in any single arm, **do not survive**
+  (Holm p = 0.14 and 0.13); they hold in 1 of 4 temperature conditions.
+
+`imagery`, `sensory_density` and `abstract_ratio` are null at every rank and
+every temperature.
+
+> The sampler's choice does not measurably change what kind of poem you get.
+> What it changes is whether there was a poem to choose between at all.
+
+This is a negative result on the original hypothesis. It is reported as one.
+
 ## How the measurement stays honest
 
 A poem and its shadow share prompt, seed, model, sampling parameters, token count

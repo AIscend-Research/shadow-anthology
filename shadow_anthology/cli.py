@@ -414,10 +414,39 @@ def cmd_corpus(a: argparse.Namespace) -> int:
 
 
 def cmd_render(a: argparse.Namespace) -> int:
-    t = GenerationTrace.load(a.trace)
-    sh = shadow_poem(t, a.rank)
-    write_html(a.out, t, shadow=sh, title=a.title, depth=a.depth)
-    print(f"wrote {a.out}")
+    # A corpus file holds hundreds of poems; pick one rather than being stuck
+    # with whichever trace happens to be lying around.
+    if a.trace.endswith(".jsonl"):
+        traces = load_traces(a.trace)
+        if a.pick == "best":
+            # most near-ties = the most genuinely contested poem, which is the
+            # one worth reading beside its shadow
+            t = max(traces, key=lambda x: sum(1 for s in x.steps if s.margin < 0.15))
+        else:
+            t = traces[int(a.pick)]
+        print(f"picked trace {traces.index(t)} of {len(traces)}", file=sys.stderr)
+    else:
+        t = GenerationTrace.load(a.trace)
+
+    # Gated by default. The full comb substitutes at every position and reads
+    # as word salad -- true to the method, but the wrong thing to put in front
+    # of a reader as the headline artifact.
+    # preserve_structure keeps line breaks intact so both readings stay verse.
+    keep = not a.token_level
+    gated = gated_shadow(
+        t, a.rank, top_n=a.gate_top_n, max_cost=a.gate_max_cost,
+        preserve_structure=keep,
+    )
+    full = shadow_poem(
+        t, a.rank, preserve_structure=keep, word_aligned=keep
+    )
+    # Both layers ship in the page: gated is legible, full is what the method
+    # recovers. --full only changes which one the page opens on.
+    write_html(a.out, t, shadow=gated, full_shadow=full, title=a.title, depth=a.depth)
+    print(
+        f"wrote {a.out} — modes: poem / gated ({gated.n_substitutions} swapped) "
+        f"/ full ({full.n_substitutions} swapped) / both"
+    )
     return 0
 
 
@@ -500,6 +529,28 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--rank", type=int, default=1)
     r.add_argument("--depth", type=int, default=3)
     r.add_argument("--title", default="The Shadow Anthology")
+    r.add_argument(
+        "--gate-top-n", type=int, default=10,
+        help="swap only the N most contested positions (default). This is the "
+        "legible artifact; the full comb reads as word salad.",
+    )
+    r.add_argument("--gate-max-cost", type=float, default=None,
+                   help="swap only where the two readings were within N nats")
+    r.add_argument(
+        "--token-level", action="store_true",
+        help="substitute at EVERY token, including line breaks and mid-word "
+        "subword pieces -- what the statistics measure. Illegible, but it is "
+        "the object the method actually recovers.",
+    )
+    r.add_argument(
+        "--break-lines", action="store_true",
+        help="also substitute whitespace/newline tokens (as the statistics do). "
+        "Illegible, but shows every decision the sampler made.",
+    )
+    r.add_argument("--full", action="store_true",
+                   help="substitute at EVERY position (the full counterfactual comb)")
+    r.add_argument("--pick", default="best",
+                   help="with a .jsonl corpus: 'best' (most near-ties) or an index")
     r.set_defaults(fn=cmd_render)
 
     return p

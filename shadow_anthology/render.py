@@ -101,11 +101,19 @@ button[aria-pressed="true"]{color:var(--fg);border-color:var(--fg)}
 .pop .row{display:flex;justify-content:space-between;gap:.75rem}
 .pop .row.sel{color:var(--hot)}
 .pop .bar{display:inline-block;height:3px;background:var(--cool);vertical-align:middle;margin-right:.4rem}
-.shadow{display:none}
-body.mode-shadow .chosen{display:none}
-body.mode-shadow .shadow{display:inline}
-body.mode-both .shadow{display:inline;color:var(--mut);font-style:italic}
-body.mode-both .shadow::before{content:"/"}
+.sh-g,.sh-f{display:none}
+body.mode-gated .swap-g .chosen{display:none}
+body.mode-gated .swap-g .sh-g{display:inline;color:var(--hot)}
+body.mode-full .swap-f .chosen{display:none}
+body.mode-full .swap-f .sh-f{display:inline;color:var(--hot)}
+body.mode-both .swap-g .sh-g{display:inline;color:var(--hot);font-style:italic}
+/* NB: keep the backslashes doubled below. A single one is read by Python as
+   an octal escape (NUL) rather than a CSS unicode escape, and the browser
+   then renders a control character in the middle of the poem. */
+body.mode-both .swap-g .sh-g::before{content:"\\00a0|\\00a0";color:var(--line);font-style:normal}
+body.mode-both .tok.swap-g,body.mode-gated .tok.swap-g{
+ background:color-mix(in srgb,var(--hot) 10%,transparent);border-radius:2px;padding:0 .1em}
+.note{color:var(--mut);font-size:.8rem;font-style:italic;margin:-1.2rem 0 1.75rem;min-height:1.2em}
 h2{font-size:.78rem;font-weight:400;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);
  border-top:1px solid var(--line);padding-top:1.1rem;margin:3rem 0 1rem}
 table{width:100%;border-collapse:collapse;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
@@ -123,9 +131,12 @@ footer{color:var(--mut);font-size:.75rem;margin-top:4rem;border-top:1px solid va
 _JS = """
 (function(){
  var b=document.body;
+ var NOTES=__NOTES__;
  document.querySelectorAll('[data-mode]').forEach(function(btn){
   btn.addEventListener('click',function(){
    b.className='mode-'+btn.dataset.mode;
+   var n=document.getElementById('note');
+   if(n) n.textContent=NOTES[btn.dataset.mode]||'';
    document.querySelectorAll('[data-mode]').forEach(function(o){
     o.setAttribute('aria-pressed',String(o===btn));});
   });
@@ -138,6 +149,7 @@ def render_html(
     trace: GenerationTrace,
     *,
     shadow: ShadowPoem | None = None,
+    full_shadow: ShadowPoem | None = None,
     anthology: Anthology | None = None,
     title: str = "The Shadow Anthology",
     depth: int = 3,
@@ -145,24 +157,31 @@ def render_html(
 ) -> str:
     """Render one trace as a readable, self-contained page.
 
+    `shadow` is the reading shown under "gated shadow" (usually a gated one,
+    legible); `full_shadow` adds a "full shadow" mode showing the complete
+    counterfactual comb. Offering both is the honest presentation: the gated
+    version is readable, the full one is what the method actually recovers.
+
     `depth` controls how many rejected alternatives each token exposes.
     Set `standalone=False` to emit body content only (for embedding).
     """
     sh = shadow or shadow_poem(trace, 1)
-    body = _body(trace, sh, anthology, title, depth)
+    body = _body(trace, sh, full_shadow, anthology, title, depth)
     if not standalone:
         return body
+    js = _JS.replace("__NOTES__", json.dumps(_NOTES))
     return (
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
         f"<title>{html.escape(title)}</title>\n<style>{_CSS}</style>\n</head>\n"
-        f"<body class=\"mode-poem\">\n{body}\n<script>{_JS}</script>\n</body>\n</html>\n"
+        f"<body class=\"mode-poem\">\n{body}\n<script>{js}</script>\n</body>\n</html>\n"
     )
 
 
 def _body(
     trace: GenerationTrace,
     sh: ShadowPoem,
+    full: ShadowPoem | None,
     anth: Anthology | None,
     title: str,
     depth: int,
@@ -170,10 +189,17 @@ def _body(
     parts = [
         '<div class="wrap">',
         f"<h1>{html.escape(title)}</h1>",
-        '<p class="sub">The poem as written, and the poems rejected at every step.</p>',
+        '<p class="sub">'
+        + (
+            "The poem as written, with its most contested choices swapped for the "
+            "ones the sampler rejected."
+            if sh.gated
+            else "The poem as written, and the poem rejected at every step."
+        )
+        + " Hover any word for the alternatives that were in contention.</p>",
         _meta(trace, sh),
-        _controls(),
-        _poem_markup(trace, sh, depth),
+        _controls(full is not None),
+        _poem_markup(trace, sh, full, depth),
         _calls_table(sh),
     ]
     if anth is not None and len(anth):
@@ -199,23 +225,45 @@ def _meta(trace: GenerationTrace, sh: ShadowPoem) -> str:
         f"{len(trace)} tokens",
         f"off-argmax {trace.offrank_fraction:.1%}",
         f"mean H {trace.mean_entropy:.2f} bits",
+        (f"gated shadow: {sh.n_substitutions}/{len(trace)} positions swapped"
+         if sh.gated else f"full shadow: all {sh.n_substitutions} positions swapped"),
         f"shadow distance {sh.total_gap:.1f} nats",
     ]
     return '<div class="meta">' + "".join(f"<span>{b}</span>" for b in bits) + "</div>"
 
 
-def _controls() -> str:
-    return (
-        '<div class="controls">'
-        '<button data-mode="poem" aria-pressed="true">poem</button>'
-        '<button data-mode="shadow" aria-pressed="false">shadow</button>'
-        '<button data-mode="both" aria-pressed="false">both</button>'
-        "</div>"
-    )
+_NOTES = {
+    "poem": "The poem as the sampler wrote it.",
+    "gated": "The same poem with only its most contested choices swapped for the "
+             "tokens the sampler rejected — the places it came nearest to going "
+             "otherwise.",
+    "full": "Every eligible position swapped for its nearest-rejected token — "
+            "the full counterfactual comb. Each substitution is conditioned on "
+            "the written prefix rather than the shadow's own, so it reads as a "
+            "double rather than a poem: that is the object, not a failure of "
+            "it. Line breaks and mid-word subword pieces are held fixed so the "
+            "result stays legible; the statistics substitute at those too.",
+    "both": "Poem and rejected reading side by side at each contested position.",
+}
 
 
-def _poem_markup(trace: GenerationTrace, sh: ShadowPoem, depth: int) -> str:
+def _controls(has_full: bool) -> str:
+    btns = [("poem", "poem"), ("gated", "gated shadow")]
+    if has_full:
+        btns.append(("full", "full shadow"))
+    btns.append(("both", "both"))
+    out = '<div class="controls">'
+    for i, (mode, label) in enumerate(btns):
+        out += (f'<button data-mode="{mode}" aria-pressed="{str(i == 0).lower()}">'
+                f"{label}</button>")
+    return out + '</div><p class="note" id="note">' + _NOTES["poem"] + "</p>"
+
+
+def _poem_markup(
+    trace: GenerationTrace, sh: ShadowPoem, full: ShadowPoem | None, depth: int
+) -> str:
     sub_at = {s.index: s for s in sh.substitutions}
+    full_at = {s.index: s for s in (full.substitutions if full else [])}
     out = ['<div class="poem">']
     for step in trace.steps:
         chosen = step.chosen
@@ -224,7 +272,14 @@ def _poem_markup(trace: GenerationTrace, sh: ShadowPoem, depth: int) -> str:
         if alts:
             gap = abs(chosen.logprob - alts[0].logprob)
             cls += " c1" if gap < 0.10 else (" c2" if gap < 0.40 else (" c3" if gap < 1.0 else ""))
-        shadow_tok = sub_at[step.index].shadow.text if step.index in sub_at else chosen.text
+        # Emit a shadow span ONLY where the shadow actually differs. Emitting
+        # one for every token (the previous behaviour) made "both" mode
+        # interleave the entire text into an unreadable mush, even when the
+        # shadow only diverged in a handful of places.
+        swapped = step.index in sub_at
+        shadow_tok = sub_at[step.index].shadow.text if swapped else None
+        full_swapped = step.index in full_at
+        full_tok = full_at[step.index].shadow.text if full_swapped else None
 
         rows = [f'<div class="hd">position {step.index} &middot; '
                 f'H={step.entropy:.2f} bits &middot; rank taken {step.chosen_rank}</div>']
@@ -238,12 +293,17 @@ def _poem_markup(trace: GenerationTrace, sh: ShadowPoem, depth: int) -> str:
                 f"<span>{math.exp(c.logprob):.3f}</span></div>"
             )
         pop = f'<span class="pop">{"".join(rows)}</span>'
-        out.append(
-            f'<span class="{cls}">'
-            f'<span class="chosen">{html.escape(chosen.text)}</span>'
-            f'<span class="shadow">{html.escape(shadow_tok)}</span>'
-            f"{pop}</span>"
-        )
+        if swapped or full_swapped:
+            body = f'<span class="chosen">{html.escape(chosen.text)}</span>'
+            if swapped:
+                body += f'<span class="sh-g">{html.escape(shadow_tok or "")}</span>'
+                cls += " swap-g"
+            if full_swapped:
+                body += f'<span class="sh-f">{html.escape(full_tok or "")}</span>'
+                cls += " swap-f"
+        else:
+            body = html.escape(chosen.text)
+        out.append(f'<span class="{cls}">{body}{pop}</span>')
     out.append("</div>")
     return "".join(out)
 

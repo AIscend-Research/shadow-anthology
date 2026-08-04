@@ -25,6 +25,7 @@ BACKEND="${BACKEND:-hf}"
 SAMPLES="${SAMPLES:-16}"       # per prompt; 16 prompts x 16 = 256 poems per arm
 PERM="${PERM:-20000}"          # permutation resamples
 PROMPTS="${PROMPTS:-prompts/poems.txt}"
+RUNS="${RUNS:-runs}"           # output dir; set it to compare models side by side
 PY="${PY:-python}"
 
 if [ "$BACKEND" = "hf" ]; then
@@ -46,7 +47,7 @@ else
   CORPUS_BE=(--backend fireworks --model "$MODEL" --endpoint chat)
   BRANCH_BE=(--backend fireworks --model "$MODEL" --endpoint completions)
   SLICE=(--poem-marker "$MARKER")
-  export MARKER
+  export MARKER RUNS
   if [ -z "${FIREWORKS_API_KEY:-}" ]; then
     echo "FIREWORKS_API_KEY is not set." >&2
     echo "  echo \"export FIREWORKS_API_KEY='fw_...'\" >> ~/.zshrc && source ~/.zshrc" >&2
@@ -56,9 +57,21 @@ fi
 
 SAMP=(--candidates "$CANDS" --max-tokens "$MAXTOK" --top-p 0.95 --system "$SYSTEM")
 
-mkdir -p runs
+mkdir -p "$RUNS"
 step() { printf '\n\033[1m=== %s\033[0m\n' "$*"; }
-echo "backend=$BACKEND model=$MODEL samples=$SAMPLES candidates=$CANDS"
+
+# Resume: an arm whose summary.txt exists is complete and is skipped, so an
+# interrupted run picks up where it stopped instead of regenerating hours of
+# identical work. Seeds are deterministic, so a resumed arm is byte-identical
+# to one produced in a single pass. FORCE=1 recomputes everything.
+done_already() {
+  if [ "${FORCE:-0}" != "1" ] && [ -f "$1/summary.txt" ]; then
+    echo "  skip $(basename "$1") — already complete (FORCE=1 to redo)"
+    return 0
+  fi
+  return 1
+}
+echo "backend=$BACKEND model=$MODEL samples=$SAMPLES candidates=$CANDS out=$RUNS"
 
 # ---------------------------------------------------------------- smoke test
 # One generation through the exact code path of the real run. A bad key, a
@@ -66,14 +79,14 @@ echo "backend=$BACKEND model=$MODEL samples=$SAMPLES candidates=$CANDS"
 # instead of verse surfaces here rather than partway into a 256-generation arm.
 step "SMOKE TEST"
 $PY -m shadow_anthology.cli trace "${CORPUS_BE[@]}" "${SAMP[@]}" \
-  --prompt "Write a short poem about salt." --out runs/smoke.json >/dev/null
+  --prompt "Write a short poem about salt." --out "$RUNS"/smoke.json >/dev/null
 
-if BACKEND="$BACKEND" $PY - <<'PYEOF'
+if BACKEND="$BACKEND" RUNS="$RUNS" $PY - <<'PYEOF'
 import os, sys
 from shadow_anthology import GenerationTrace
 from shadow_anthology.corpus import REASONING_MARKERS, slice_to_poem
 
-t = GenerationTrace.load("runs/smoke.json")
+t = GenerationTrace.load(os.environ["RUNS"] + "/smoke.json")
 if os.environ["BACKEND"] == "hf":
     poem = t
 else:
@@ -110,70 +123,75 @@ fi
 
 # ------------------------------------------------------------------------ E1
 step "E1 — main corpus, T=1.0  [GENERATES]"
-$PY -m shadow_anthology.cli corpus --prompts "$PROMPTS" \
+done_already "$RUNS"/T1.0 || $PY -m shadow_anthology.cli corpus --prompts "$PROMPTS" \
   "${CORPUS_BE[@]}" "${SAMP[@]}" ${SLICE[@]+"${SLICE[@]}"} \
   --samples "$SAMPLES" --temperature 1.0 --concurrency "$CONC" \
-  --permutations "$PERM" --out runs/T1.0
+  --permutations "$PERM" --out "$RUNS"/T1.0
 
-if grep -q "CORPUS SANITY WARNING" runs/T1.0/summary.txt; then
+if grep -q "CORPUS SANITY WARNING" "$RUNS"/T1.0/summary.txt; then
   printf '\n\033[1mSTOPPING: E1 did not produce poems.\033[0m\n'
-  sed -n '/CORPUS SANITY WARNING/,/^!\{20,\}$/p' runs/T1.0/summary.txt
-  echo; echo "Inspect runs/T1.0/pairs.txt before re-running."
+  sed -n '/CORPUS SANITY WARNING/,/^!\{20,\}$/p' "$RUNS"/T1.0/summary.txt
+  echo; echo "Inspect $RUNS/T1.0/pairs.txt before re-running."
   exit 1
 fi
 
 # ------------------------------------------------------------------------ E2
 step "E2 — rank depth 1/2/3, reusing E1 traces  [FREE]"
 for r in 1 2 3; do
-  $PY -m shadow_anthology.cli corpus --from-traces runs/T1.0/traces.jsonl \
-    --rank "$r" --permutations "$PERM" --out "runs/rank$r"
+  done_already "$RUNS/rank$r" || $PY -m shadow_anthology.cli corpus \
+    --from-traces "$RUNS"/T1.0/traces.jsonl \
+    --rank "$r" --permutations "$PERM" --out "$RUNS/rank$r"
 done
 
 # ------------------------------------------------------------------------ E3
 step "E3 — temperature sweep  [GENERATES]"
 for t in 0.3 0.7 1.3; do   # T=1.0 is E1; don't pay for it twice
+  done_already "$RUNS/T$t" && continue
   $PY -m shadow_anthology.cli corpus --prompts "$PROMPTS" \
     "${CORPUS_BE[@]}" "${SAMP[@]}" ${SLICE[@]+"${SLICE[@]}"} \
     --samples "$SAMPLES" --temperature "$t" --concurrency "$CONC" \
-    --permutations "$PERM" --out "runs/T$t"
+    --permutations "$PERM" --out "$RUNS/T$t"
 done
 
 # ------------------------------------------------------------------------ E4
 step "E4 — gated shadow (12 closest calls only), reusing E1 traces  [FREE]"
-$PY -m shadow_anthology.cli corpus --from-traces runs/T1.0/traces.jsonl \
-  --top-n 12 --permutations "$PERM" --out runs/gated
+done_already "$RUNS"/gated || $PY -m shadow_anthology.cli corpus --from-traces "$RUNS"/T1.0/traces.jsonl \
+  --top-n 12 --permutations "$PERM" --out "$RUNS"/gated
 
 # ------------------------------------------------------------------------ E5
 # Non-fatal: E1-E4 are the paired statistics and are already on disk by now.
 # A branching failure must not discard them.
 step "E5 — branching anthology  [GENERATES]"
-if $PY -m shadow_anthology.cli trace "${BRANCH_BE[@]}" "${SAMP[@]}" \
+if [ "${FORCE:-0}" != "1" ] && [ -f "$RUNS"/anthology.json ]; then
+  echo "  skip E5 — already complete (FORCE=1 to redo)"
+elif $PY -m shadow_anthology.cli trace "${BRANCH_BE[@]}" "${SAMP[@]}" \
       --prompt "Write a short poem about winter light on water." \
-      --temperature 1.0 --out runs/branch_trunk.json >/dev/null; then
-  $PY -m shadow_anthology.cli branch --trace runs/branch_trunk.json "${BRANCH_BE[@]}" \
+      --temperature 1.0 --out "$RUNS"/branch_trunk.json >/dev/null; then
+  $PY -m shadow_anthology.cli branch --trace "$RUNS"/branch_trunk.json "${BRANCH_BE[@]}" \
     --points 8 --ranks 1 2 --budget 24 --max-tokens "$MAXTOK" \
-    --out runs/anthology.json || echo "E5 branching failed (see above)"
-  $PY -m shadow_anthology.cli render --trace runs/branch_trunk.json \
-    --out runs/poem.html --title "The Shadow Anthology" || true
+    --out "$RUNS"/anthology.json || echo "E5 branching failed (see above)"
+  $PY -m shadow_anthology.cli render --trace "$RUNS"/branch_trunk.json \
+    --out "$RUNS"/poem.html --title "The Shadow Anthology" || true
 else
   echo "E5 SKIPPED: this backend/endpoint cannot resume from a forced prefix."
-  $PY - <<'PYEOF' || true
+  RUNS="$RUNS" $PY - <<'PYEOF' || true
+import os
 from shadow_anthology import load_traces, write_html
-ts = load_traces("runs/T1.0/traces.jsonl")
+ts = load_traces(os.environ["RUNS"] + "/T1.0/traces.jsonl")
 if ts:
-    write_html("runs/poem.html", ts[0], title="The Shadow Anthology")
-    print("rendered runs/poem.html from a corpus trace instead")
+    write_html(os.environ["RUNS"] + "/poem.html", ts[0], title="The Shadow Anthology")
+    print("rendered "$RUNS"/poem.html from a corpus trace instead")
 PYEOF
 fi
 
 # --------------------------------------------------------------------- recap
 step "DONE"
 echo "off-argmax fraction by temperature (the sampler's editorial footprint):"
-for d in runs/T0.3 runs/T0.7 runs/T1.0 runs/T1.3; do
+for d in "$RUNS"/T0.3 "$RUNS"/T0.7 "$RUNS"/T1.0 "$RUNS"/T1.3; do
   [ -f "$d/summary.txt" ] && printf '  %-12s %s\n' "$(basename "$d")" \
     "$(grep offrank_fraction "$d/summary.txt" | awk '{print $2}')"
 done
 echo
-echo "per-run detail : runs/*/summary.txt"
-echo "poem/shadow    : runs/*/pairs.txt"
-echo "reading page   : runs/poem.html"
+echo "per-run detail : "$RUNS"/*/summary.txt"
+echo "poem/shadow    : "$RUNS"/*/pairs.txt"
+echo "reading page   : "$RUNS"/poem.html"

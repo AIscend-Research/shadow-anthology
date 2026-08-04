@@ -190,6 +190,11 @@ class HFBackend:
         # Every id that ends a turn. Chat models stop on a template token
         # (<|im_end|>) that is not the tokenizer's eos_token_id, so stopping on
         # eos alone leaves the marker in the text.
+        # Special/template tokens must never surface as *alternatives* either.
+        # Stopping on them as the chosen token is not enough: a shadow poem
+        # built from the candidate lists would otherwise contain a literal
+        # "<|im_end|>" in the middle of the verse.
+        self._special_ids = set(getattr(self.tokenizer, "all_special_ids", []) or [])
         self._stop_ids = {
             i for i in (
                 self.tokenizer.eos_token_id,
@@ -273,7 +278,15 @@ class HFBackend:
                 logits = out.logits[0, -1, :]
 
                 cand_ids, samp_lps, raw_lps = self._step_distribution(
-                    logits, temperature, top_p, top_k, candidates
+                    logits, temperature, top_p, top_k, candidates + 4
+                )
+                keep = [
+                    (t, lp, rlp)
+                    for t, lp, rlp in zip(cand_ids, samp_lps, raw_lps)
+                    if t not in self._special_ids
+                ][:candidates] or list(zip(cand_ids, samp_lps, raw_lps))[:candidates]
+                cand_ids, samp_lps, raw_lps = (
+                    [k[0] for k in keep], [k[1] for k in keep], [k[2] for k in keep]
                 )
                 cands = [
                     Candidate(

@@ -160,13 +160,57 @@ class ShadowPoem:
 # --------------------------------------------------------------------------
 
 
-def shadow_poem(trace: GenerationTrace, rank: int = 1) -> ShadowPoem:
+def is_structural(text: str) -> bool:
+    """True for tokens that carry line structure rather than lexical content."""
+    return text.strip() == ""
+
+
+def _word_initial(text: str) -> bool:
+    """True if this token starts a new word rather than continuing one."""
+    return text[:1].isspace() or text[:1] in "\n\t" or not text[:1].isalnum()
+
+
+def _occupies_whole_word(trace: GenerationTrace, i: int, alt: Candidate) -> bool:
+    """True if swapping step i for `alt` replaces a complete word.
+
+    Subword tokenisers split words into pieces, so replacing one piece welds a
+    new fragment onto the leftovers -- "peta|l" with "peta" swapped for
+    " flower" becomes "floweral". Requiring that the position, its
+    replacement, AND the following token are all word-initial keeps whole
+    words intact.
+    """
+    if not _word_initial(trace.steps[i].chosen.text) or not _word_initial(alt.text):
+        return False
+    nxt = trace.steps[i + 1] if i + 1 < len(trace.steps) else None
+    return nxt is None or _word_initial(nxt.chosen.text)
+
+
+def shadow_poem(
+    trace: GenerationTrace,
+    rank: int = 1,
+    *,
+    preserve_structure: bool = False,
+    word_aligned: bool = False,
+) -> ShadowPoem:
     """The poem written from the `rank`-th rejected token at every position.
 
     rank=1 is the nearest-rejected sibling; rank=2, 3, ... walk further down
     the model's preference order, producing progressively stranger doubles.
     Positions with no candidate at that depth keep the original token (and are
     not counted as substitutions), so the result stays the same length.
+
+    `preserve_structure=True` leaves whitespace-only tokens (line breaks,
+    indentation) alone. The sampler did choose those, so substituting them is
+    defensible --- but it conflates a decision about *lineation* with one about
+    *wording*, and it makes the shadow illegible as verse because lines fuse.
+    Default False so the statistics measure every decision the sampler made;
+    the renderer sets True so the artifact can be read.
+
+    `word_aligned=True` additionally skips positions where the swap would land
+    mid-word, which is what produces fragments like "floweral". It yields a
+    readable shadow at the cost of measuring fewer decisions: it is a
+    *different object*, a word-level shadow rather than a token-level one, and
+    should be labelled as such wherever it is shown.
     """
     if rank < 1:
         raise ValueError("rank must be >= 1 (rank 0 is the poem itself)")
@@ -174,7 +218,26 @@ def shadow_poem(trace: GenerationTrace, rank: int = 1) -> ShadowPoem:
     pieces: list[str] = []
     subs: list[Substitution] = []
     for step in trace.steps:
+        if preserve_structure and is_structural(step.chosen.text):
+            pieces.append(step.chosen.text)
+            continue
         alt = step.alternative(rank)
+        if preserve_structure and alt is not None and is_structural(alt.text):
+            # Swapping a word for a line break also destroys the shape.
+            alt = next(
+                (a for a in step.alternatives()[rank - 1 :] if not is_structural(a.text)),
+                None,
+            )
+        if word_aligned and alt is not None:
+            alt = next(
+                (
+                    a
+                    for a in step.alternatives()[rank - 1 :]
+                    if not (preserve_structure and is_structural(a.text))
+                    and _occupies_whole_word(trace, step.index, a)
+                ),
+                None,
+            )
         if alt is None:
             pieces.append(step.chosen.text)
             continue
@@ -193,6 +256,7 @@ def gated_shadow(
     top_n: int | None = None,
     min_entropy: float | None = None,
     by: str = "gap",
+    preserve_structure: bool = False,
 ) -> ShadowPoem:
     """Substitute only at *contested* positions; keep the poem elsewhere.
 
@@ -212,7 +276,14 @@ def gated_shadow(
 
     eligible: list[tuple[TokenStep, Candidate, Substitution]] = []
     for step in trace.steps:
+        if preserve_structure and is_structural(step.chosen.text):
+            continue
         alt = step.alternative(rank)
+        if preserve_structure and alt is not None and is_structural(alt.text):
+            alt = next(
+                (a for a in step.alternatives()[rank - 1 :] if not is_structural(a.text)),
+                None,
+            )
         if alt is None:
             continue
         sub = _substitution(trace, step, alt)
