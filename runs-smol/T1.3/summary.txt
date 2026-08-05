@@ -1,0 +1,29 @@
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+CORPUS SANITY WARNING -- read before the statistics below:
+  * 79% of generations hit the max_tokens cap, so the texts are truncated mid-thought rather than finished poems.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+shadow-anthology corpus: 128 poem/shadow pairs
+  model=HuggingFaceTB/SmolLM2-1.7B-Instruct backend=hf rank=1 T=1.3
+
+Sampler footprint (how much of the text is the draw, not the model):
+  mean_tokens                  349.5078
+  mean_entropy_bits            2.6579
+  mean_top1_top2_margin_nats   1.0698
+  offrank_fraction             0.5394
+  coin_flip_rate_at_0.1nats    0.0514
+  shadow_minus_poem_surprisal_bits -0.1809
+  mean_shadow_divergence_rate  0.9354
+
+Paired tests, poem minus shadow (Holm-corrected):
+  * repetition           n=128  Δ=+0.0259 [+0.0196,+0.0323] d_z=+0.704 p=0.00055
+  * type_token_ratio     n=128  Δ=+0.0307 [+0.0218,+0.0400] d_z=+0.590 p=0.00055
+  * mean_word_length     n=128  Δ=+0.1950 [+0.1570,+0.2342] d_z=+0.885 p=0.00055
+    valence              n=128  Δ=-0.0557 [-0.0972,-0.0137] d_z=-0.229 p=0.084
+    imagery              n=128  Δ=+0.0061 [+0.0001,+0.0119] d_z=+0.181 p=0.3062
+    sensory_density      n=128  Δ=+0.0017 [-0.0003,+0.0037] d_z=+0.149 p=0.5727
+    arousal              n=128  Δ=+0.0248 [-0.0063,+0.0539] d_z=+0.144 p=0.5727
+    abstract_ratio       n=128  Δ=+0.0075 [-0.0026,+0.0181] d_z=+0.125 p=0.6584
+    concreteness         n=128  Δ=+0.0116 [-0.0086,+0.0312] d_z=+0.102 p=0.7582
+    rarity               n=128  Δ=-0.0020 [-0.0071,+0.0029] d_z=-0.069 p=0.881
+    risk                 n=128  Δ=-0.0009 [-0.0054,+0.0036] d_z=-0.033 p=0.881
