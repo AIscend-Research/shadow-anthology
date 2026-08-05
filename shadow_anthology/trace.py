@@ -313,8 +313,19 @@ class GenerationTrace:
 
     @staticmethod
     def load(path: str) -> "GenerationTrace":
+        """Load one trace. Raises a useful error if handed a JSONL corpus."""
         with open(path, encoding="utf-8") as fh:
-            return GenerationTrace.from_dict(json.load(fh))
+            text = fh.read()
+        try:
+            return GenerationTrace.from_dict(json.loads(text))
+        except json.JSONDecodeError:
+            if "\n" in text.strip():
+                raise ValueError(
+                    f"{path} looks like a JSON Lines corpus (many traces), not a "
+                    "single trace. Use load_traces(), or pass it to `shadow "
+                    "render` which selects one for you."
+                ) from None
+            raise
 
 
 def save_traces(traces: Sequence[GenerationTrace], path: str) -> None:

@@ -1,0 +1,24 @@
+shadow-anthology corpus: 128 poem/shadow pairs
+  model=HuggingFaceTB/SmolLM2-1.7B-Instruct backend=hf rank=2 T=None
+
+Sampler footprint (how much of the text is the draw, not the model):
+  mean_tokens                  150.9922
+  mean_entropy_bits            1.9598
+  mean_top1_top2_margin_nats   1.1838
+  offrank_fraction             0.4100
+  coin_flip_rate_at_0.1nats    0.0187
+  shadow_minus_poem_surprisal_bits 0.3490
+  mean_shadow_divergence_rate  0.7617
+
+Paired tests, poem minus shadow (Holm-corrected):
+  * rarity               n=128  Δ=-0.0187 [-0.0252,-0.0124] d_z=-0.519 p=0.00055
+  * repetition           n=128  Δ=+0.0454 [+0.0365,+0.0549] d_z=+0.863 p=0.00055
+  * risk                 n=128  Δ=-0.0186 [-0.0240,-0.0133] d_z=-0.605 p=0.00055
+  * abstract_ratio       n=128  Δ=+0.0215 [+0.0085,+0.0356] d_z=+0.272 p=0.0216
+    valence              n=128  Δ=-0.0492 [-0.0962,-0.0023] d_z=-0.181 p=0.3038
+    concreteness         n=128  Δ=-0.0277 [-0.0569,+0.0007] d_z=-0.168 p=0.3417
+    type_token_ratio     n=128  Δ=-0.0096 [-0.0205,+0.0015] d_z=-0.150 p=0.456
+    imagery              n=128  Δ=-0.0066 [-0.0161,+0.0024] d_z=-0.125 p=0.6532
+    sensory_density      n=128  Δ=-0.0007 [-0.0039,+0.0022] d_z=-0.042 p=1
+    arousal              n=128  Δ=+0.0030 [-0.0426,+0.0490] d_z=+0.011 p=1
+    mean_word_length     n=128  Δ=+0.0198 [-0.0317,+0.0711] d_z=+0.068 p=1

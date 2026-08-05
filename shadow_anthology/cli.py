@@ -416,7 +416,17 @@ def cmd_corpus(a: argparse.Namespace) -> int:
 def cmd_render(a: argparse.Namespace) -> int:
     # A corpus file holds hundreds of poems; pick one rather than being stuck
     # with whichever trace happens to be lying around.
-    if a.trace.endswith(".jsonl"):
+    # Detect a corpus by PARSING, not by filename or line count: a single
+    # trace is written pretty-printed across many lines, so counting lines
+    # misclassifies it, and the extension can be anything.
+    with open(a.trace, encoding="utf-8") as _fh:
+        _raw = _fh.read()
+    try:
+        json.loads(_raw)
+        _is_corpus = False          # parses whole -> one trace
+    except json.JSONDecodeError:
+        _is_corpus = True           # trailing data -> JSON Lines
+    if _is_corpus:
         traces = load_traces(a.trace)
         if a.pick == "best":
             # most near-ties = the most genuinely contested poem, which is the

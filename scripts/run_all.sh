@@ -32,8 +32,11 @@ if [ "$BACKEND" = "hf" ]; then
   MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
   CANDS="${CANDS:-20}"         # full top-k, not the hosted cap of ~5
   CONC="${CONC:-1}"            # one torch module cannot serve parallel loops
-  MAXTOK="${MAXTOK:-160}"
-  SYSTEM="${SYSTEM:-Write only the poem. No title, no commentary, no explanation.}"
+  MAXTOK="${MAXTOK:-224}"
+  # Length guidance matters: without it, models that favour longer poems run
+  # into the token cap and every text is truncated mid-line, which corrupts
+  # repetition/TTR and reads badly. Ask for a length the cap can accommodate.
+  SYSTEM="${SYSTEM:-Write only the poem. No title, no commentary, no explanation. Keep it under 12 short lines.}"
   CORPUS_BE=(--backend hf --model "$MODEL")
   BRANCH_BE=("${CORPUS_BE[@]}")          # branches natively
   SLICE=()                               # no reasoning to slice away
