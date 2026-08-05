@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
@@ -102,6 +104,7 @@ def generate_traces(
     system: str | None = None,
     seed0: int = 0,
     concurrency: int = 1,
+    checkpoint: str | None = None,
     on_progress: Callable[[int, int, GenerationTrace], None] | None = None,
 ) -> list[GenerationTrace]:
     """Generate the (prompt x sample) grid. This is the only part that costs.
@@ -114,6 +117,12 @@ def generate_traces(
     for a single local `hf` model --- one torch module cannot serve concurrent
     generate loops. Results are always returned in grid order regardless of
     completion order, so a run is deterministic no matter the concurrency.
+
+    `checkpoint` is a JSONL path each trace is appended to as it completes.
+    On restart, already-generated grid positions are loaded and skipped, so an
+    interrupted arm resumes mid-way instead of starting over. Because seeds are
+    a deterministic function of grid position, a resumed arm is identical to
+    one produced in a single pass.
     """
     grid = [
         (i, p_i, s_i, prompt)
@@ -137,7 +146,38 @@ def generate_traces(
         )
 
     out: dict[int, GenerationTrace] = {}
-    done = 0
+    if checkpoint and os.path.exists(checkpoint):
+        with open(checkpoint, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    out[int(rec["_grid_index"])] = GenerationTrace.from_dict(rec)
+                except Exception:
+                    continue  # truncated final line from a hard kill
+        if out:
+            print(
+                f"  resuming: {len(out)}/{len(grid)} already generated",
+                file=sys.stderr,
+            )
+        grid = [g for g in grid if g[0] not in out]
+
+    ckpt_fh = open(checkpoint, "a", encoding="utf-8") if checkpoint else None
+    lock = threading.Lock()
+
+    def record(i: int, tr: GenerationTrace) -> None:
+        out[i] = tr
+        if ckpt_fh is not None:
+            with lock:
+                d = tr.to_dict()
+                d["_grid_index"] = i
+                ckpt_fh.write(json.dumps(d, ensure_ascii=False) + "\n")
+                ckpt_fh.flush()
+
+    done = len(out)
+    total = done + len(grid)
     if concurrency > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -145,19 +185,21 @@ def generate_traces(
             futures = [pool.submit(one, item) for item in grid]
             for fut in as_completed(futures):
                 i, tr = fut.result()
-                out[i] = tr
+                record(i, tr)
                 done += 1
                 if on_progress:
-                    on_progress(done, len(grid), tr)
+                    on_progress(done, total, tr)
     else:
         for item in grid:
             i, tr = one(item)
-            out[i] = tr
+            record(i, tr)
             done += 1
             if on_progress:
-                on_progress(done, len(grid), tr)
+                on_progress(done, total, tr)
 
-    return [out[i] for i in range(len(grid))]
+    if ckpt_fh is not None:
+        ckpt_fh.close()
+    return [out[i] for i in sorted(out)]
 
 
 def analyse_traces(
@@ -485,4 +527,8 @@ def save_corpus(res: CorpusResult, outdir: str) -> dict[str, str]:
             fh.write(s.text.strip() + "\n\n")
     with open(paths["summary"], "w", encoding="utf-8") as fh:
         fh.write(res.summary() + "\n")
+    # The arm is complete; the resume checkpoint is now redundant.
+    partial = os.path.join(outdir, "traces.partial.jsonl")
+    if os.path.exists(partial):
+        os.remove(partial)
     return paths

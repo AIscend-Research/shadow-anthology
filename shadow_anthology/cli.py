@@ -378,8 +378,10 @@ def cmd_corpus(a: argparse.Namespace) -> int:
         def progress(i: int, n: int, _t: Any) -> None:
             print(f"\r  generating {i}/{n}", end="", file=sys.stderr, flush=True)
 
+        os.makedirs(a.out, exist_ok=True)
         traces = generate_traces(
             be, prompts,
+            checkpoint=os.path.join(a.out, "traces.partial.jsonl"),
             samples_per_prompt=a.samples,
             max_tokens=a.max_tokens,
             temperature=a.temperature,

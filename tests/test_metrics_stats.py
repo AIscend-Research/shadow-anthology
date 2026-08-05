@@ -334,6 +334,39 @@ def test_sanity_guard_flags_reasoning_preamble(be):
     assert warns and any("reasoning-model preamble" in w for w in warns)
 
 
+def test_interrupted_arm_resumes_from_checkpoint(be, tmp_path):
+    """An interrupt must cost only the in-flight generation, not the arm.
+
+    Three separate runs were lost to Ctrl-C at 116/128, 93/256 and 63/128
+    before this existed, because resume worked only at whole-arm granularity.
+    """
+    from shadow_anthology.corpus import generate_traces
+
+    ck = str(tmp_path / "partial.jsonl")
+    prompts = ["a", "b", "c"]
+
+    class Stop(Exception):
+        pass
+
+    def stop_at_5(i, n, t):
+        if i >= 5:
+            raise Stop
+
+    with pytest.raises(Stop):
+        generate_traces(
+            be, prompts, samples_per_prompt=4, max_tokens=20,
+            checkpoint=ck, on_progress=stop_at_5,
+        )
+    assert sum(1 for _ in open(ck)) == 5, "completed work must be on disk"
+
+    resumed = generate_traces(
+        be, prompts, samples_per_prompt=4, max_tokens=20, checkpoint=ck
+    )
+    clean = generate_traces(be, prompts, samples_per_prompt=4, max_tokens=20)
+    assert [t.text for t in resumed] == [t.text for t in clean]
+    assert [t.seed for t in resumed] == list(range(12))
+
+
 def test_concurrency_does_not_change_results(be):
     """Parallel generation must be a pure speedup: same traces, same order."""
     from shadow_anthology.corpus import generate_traces
