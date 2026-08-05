@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 
 from shadow_anthology import get_backend, load_traces, shadow_poem
@@ -47,7 +48,14 @@ def main() -> int:
     ap.add_argument("--backend", default="hf")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="study/pairs.json")
+    ap.add_argument("--checkpoint", default="study/pairs.ckpt.jsonl",
+                    help="append each pair as it is built, and resume from it")
     a = ap.parse_args()
+
+    # Each pair's coin flip is drawn from its own index-seeded stream, so a
+    # resumed run assigns sides exactly as an uninterrupted one would.
+    def flip_for(i):
+        return random.Random((a.seed, i, "flip").__repr__()).random() < 0.5
 
     rng = random.Random(a.seed)
     traces = load_traces(a.traces)
@@ -70,8 +78,27 @@ def main() -> int:
     scored.sort(key=lambda x: x[0])
     print(f"{len(scored)}/{len(traces)} traces have a fork within {a.max_gap} nats")
 
+    # Resume: a branch continuation costs a full generation, so losing a
+    # part-finished run to one Ctrl-C is expensive. Completed pairs are
+    # appended as they are built and replayed on the next launch.
+    done = {}
+    if a.checkpoint and os.path.exists(a.checkpoint):
+        with open(a.checkpoint, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    p = json.loads(line)
+                    done[p["id"]] = p
+        print(f"resuming: {len(done)} pair(s) already built")
+    if a.checkpoint:
+        os.makedirs(os.path.dirname(a.checkpoint) or ".", exist_ok=True)
+    ckpt = open(a.checkpoint, "a", encoding="utf-8") if a.checkpoint else None
+
     pairs = []
     for i, (gap, t, sub) in enumerate(scored[: a.n]):
+        if f"p{i}" in done:
+            pairs.append(done[f"p{i}"])
+            continue
         alt = t.steps[sub.index].alternative(1)
         branch = be.continue_from(
             t, sub.index, alt,
@@ -80,7 +107,7 @@ def main() -> int:
         original, other = t.text.strip(), branch.text.strip()
         if not other or other == original:
             continue
-        flip = rng.random() < 0.5
+        flip = flip_for(i)
         pairs.append({
             "id": f"p{i}",
             "kind": "branch",
@@ -93,8 +120,12 @@ def main() -> int:
             "written": sub.chosen.text,
             "rejected": sub.shadow.text,
         })
-        print(f"\r  built {len(pairs)}/{a.n}", end="", flush=True)
-    print()
+        if ckpt is not None:
+            ckpt.write(json.dumps(pairs[-1], ensure_ascii=False) + "\n")
+            ckpt.flush()
+        print(f"  built {len(pairs)}/{a.n}", flush=True)
+    if ckpt is not None:
+        ckpt.close()
 
     # Attention checks: the full comb really is word salad, so a rater who is
     # reading will always pick it out. Anyone at chance here was not reading.
@@ -110,7 +141,6 @@ def main() -> int:
         })
 
     rng.shuffle(pairs)
-    import os
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w", encoding="utf-8") as fh:
         json.dump({"pairs": pairs, "model": a.model, "source": a.traces}, fh,
